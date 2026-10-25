@@ -3,34 +3,52 @@ package jsonrpc
 import (
 	"context"
 
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/pkg/rpc"
 )
 
+// privateSiteLoginWhitelist 私有站点模式下仍允许匿名访问的方法白名单。
+// 这些方法返回登录页渲染所需的元信息(站点配置、版本、当前登录态占位)。
+// 不在此白名单的 public:* 方法(如 getNodesInformation)会被私有站点拦截。
+var privateSiteLoginWhitelist = map[string]bool{
+	"public:getMe":             true,
+	"public:getPublicSettings": true,
+	"public:getVersion":        true,
+}
+
 // Dispatch 是所有传输入口的统一分发点：私有站点检查 → 权限校验 → 执行方法。
-// ctx 携带可选的取消/超时；meta 为调用者身份元数据（其中 Permission 为权限分组）。
+// ctx 携带可选的取消/超时；meta 为调用者身份元数据（Principal 为权威来源）。
 // 始终返回完整的 JsonRpcResponse（包含错误）。
 func Dispatch(ctx context.Context, meta *rpc.ContextMeta, req *rpc.JsonRpcRequest) *rpc.JsonRpcResponse {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if meta == nil {
-		meta = &rpc.ContextMeta{Permission: rpc.RoleGuest}
+		meta = &rpc.ContextMeta{Principal: rpc.NewAnonymousPrincipal()}
 	}
-	group := meta.Permission
-	if group == "" {
-		group = rpc.RoleGuest
+	// 保证 Principal 与 Permission 字段双向同步(后者用于向后兼容)。
+	if meta.Principal == nil {
+		if meta.Permission != "" {
+			meta.Principal = rpc.PrincipalFromRole(meta.Permission)
+		} else {
+			meta.Principal = rpc.NewAnonymousPrincipal()
+		}
 	}
+	// Principal is authoritative, including for handlers that still read Permission.
+	meta.Permission = meta.Principal.PrimaryRole()
 
-	// 私有站点：未登录访客一律拒绝。
-	if group == rpc.RoleGuest {
+	// 私有站点：未认证访客一律拒绝，但放行登录页所需的元信息接口(见 issue #567)。
+	// 持有有效临时分享许可(temp_key)的匿名访客同样放行，使「临时分析」分享链接在私有站点下可用；
+	// 后续 CheckPrincipal 仍会将匿名主体限制在 public:*(guest 角色)范围内，admin 方法不受影响。
+	if meta.Principal.Type == rpc.PrincipalAnonymous && !privateSiteLoginWhitelist[req.Method] && !meta.TempShareValid {
 		if privateSite, _ := config.GetAs[bool](config.PrivateSiteKey); privateSite {
 			return rpc.ErrorResponse(req.ID, rpc.PermissionDenied, "Private site enabled, please login first", nil)
 		}
 	}
 
-	// 命名空间权限校验。
-	if !rpc.CheckPermission(group, req.Method) {
+	// 命名空间权限校验:基于 Principal 的能力集(集合成员语义)。
+	if !rpc.CheckPrincipal(meta.Principal, req.Method) {
+
 		return rpc.ErrorResponse(req.ID, rpc.PermissionDenied, "Permission denied", nil)
 	}
 

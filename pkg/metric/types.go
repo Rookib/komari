@@ -2,6 +2,7 @@ package metric
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -142,9 +143,10 @@ type Definition struct {
 	//
 	// Unit 表示数值单位，例如 bytes 或 percent。
 	Unit string `json:"unit,omitempty"`
-	// RetentionDays controls raw-point retention for this metric.
+	// RetentionDays controls historical data retention for this metric. A value
+	// of zero disables persistence and removes existing metric data.
 	//
-	// RetentionDays 控制该指标原始点的保留天数。
+	// RetentionDays 控制该指标历史数据的保留天数；零表示禁用持久化并清除已有数据。
 	RetentionDays int `json:"retention_days,omitempty"`
 	// Metadata stores caller-defined metric metadata.
 	//
@@ -162,13 +164,10 @@ type Definition struct {
 
 // withDefaults fills default values on a metric definition.
 //
-// withDefaults 为指标定义填充默认类型和默认保留天数。
-func (d Definition) withDefaults(defaultRetentionDays int) Definition {
+// withDefaults 为指标定义填充默认类型。
+func (d Definition) withDefaults() Definition {
 	if d.Type == "" {
 		d.Type = TypeGauge
-	}
-	if d.RetentionDays == 0 {
-		d.RetentionDays = defaultRetentionDays
 	}
 	return d
 }
@@ -234,6 +233,9 @@ func (p Point) Validate() error {
 	if p.Timestamp.IsZero() {
 		return fmt.Errorf("%w: timestamp is required", ErrInvalidArgument)
 	}
+	if math.IsNaN(p.Value) || math.IsInf(p.Value, 0) {
+		return fmt.Errorf("%w: value must be finite", ErrInvalidArgument)
+	}
 	return nil
 }
 
@@ -251,9 +253,9 @@ func (p Point) normalized() Point {
 	return p
 }
 
-// Query loads raw metric points matching a query.
+// Query loads exact raw samples from the retained raw window.
 //
-// Query 描述原始点查询条件，包括指标、实体、时间范围、标签和分页。
+// Query 描述指标值查询条件，包括指标、实体、时间范围、标签和分页。
 type Query struct {
 	// MetricName restricts the query to one metric.
 	//
@@ -275,18 +277,55 @@ type Query struct {
 	//
 	// Tags 按标签键值精确匹配过滤采样点。
 	Tags map[string]string `json:"tags,omitempty"`
-	// Limit limits the number of raw points returned.
+	// Limit limits the number of values returned.
 	//
-	// Limit 限制返回的原始点数量。
+	// Limit 限制返回的值数量。
 	Limit int `json:"limit,omitempty"`
-	// Offset skips this many raw points before returning results.
+	// Offset skips this many values before returning results.
 	//
-	// Offset 在返回结果前跳过指定数量的原始点。
+	// Offset 在返回结果前跳过指定数量的值。
 	Offset int `json:"offset,omitempty"`
 	// Order controls chronological result ordering.
 	//
 	// Order 控制结果的时间顺序。
 	Order Order `json:"order,omitempty"`
+}
+
+// BatchQuery loads exact raw samples for multiple metrics and entities from one
+// shared time window.
+type BatchQuery struct {
+	MetricNames []string          `json:"metric_names"`
+	EntityIDs   []string          `json:"entity_ids,omitempty"`
+	Start       time.Time         `json:"start"`
+	End         time.Time         `json:"end"`
+	Tags        map[string]string `json:"tags,omitempty"`
+	Order       Order             `json:"order,omitempty"`
+}
+
+// BatchSeriesSpec describes the rollup output requested for one metric.
+type BatchSeriesSpec struct {
+	MetricName     string
+	Aggregations   []Aggregation
+	Interval       time.Duration
+	PreserveSeries bool
+}
+
+// BatchSeriesQuery combines per-metric rollup specifications that share the
+// same time, entity, tag, and ordering filters.
+type BatchSeriesQuery struct {
+	Specs     []BatchSeriesSpec
+	EntityIDs []string
+	Start     time.Time
+	End       time.Time
+	Tags      map[string]string
+	Order     Order
+}
+
+// BatchSeriesResult contains definitions and aggregate values keyed by metric
+// and aggregation.
+type BatchSeriesResult struct {
+	Definitions map[string]Definition
+	Values      map[string]map[Aggregation][]AggregatePoint
 }
 
 // Validate checks whether the value is well formed.
@@ -325,6 +364,76 @@ func (q Query) normalized() Query {
 	return q
 }
 
+// Validate checks whether a batch raw query is well formed.
+func (q BatchQuery) Validate() error {
+	if len(q.MetricNames) == 0 {
+		return fmt.Errorf("%w: at least one metric name is required", ErrInvalidArgument)
+	}
+	for _, name := range q.MetricNames {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("%w: metric name is required", ErrInvalidArgument)
+		}
+	}
+	if q.Start.IsZero() || q.End.IsZero() {
+		return fmt.Errorf("%w: start and end time are required", ErrInvalidArgument)
+	}
+	if q.End.Before(q.Start) {
+		return fmt.Errorf("%w: end time cannot be before start time", ErrInvalidArgument)
+	}
+	switch q.Order {
+	case "", OrderAsc, OrderDesc:
+	default:
+		return fmt.Errorf("%w: unsupported order %q", ErrInvalidArgument, q.Order)
+	}
+	return nil
+}
+
+func (q BatchQuery) normalized() BatchQuery {
+	q.Start = q.Start.UTC()
+	q.End = q.End.UTC()
+	if q.Order == "" {
+		q.Order = OrderAsc
+	}
+	return q
+}
+
+// Validate checks whether a batch rollup query is well formed.
+func (q BatchSeriesQuery) Validate() error {
+	if len(q.Specs) == 0 {
+		return fmt.Errorf("%w: at least one series specification is required", ErrInvalidArgument)
+	}
+	seen := make(map[string]struct{}, len(q.Specs))
+	for _, spec := range q.Specs {
+		if _, ok := seen[spec.MetricName]; ok {
+			return fmt.Errorf("%w: duplicate series specification for metric %q", ErrInvalidArgument, spec.MetricName)
+		}
+		seen[spec.MetricName] = struct{}{}
+		if len(spec.Aggregations) == 0 {
+			return fmt.Errorf("%w: at least one aggregation is required for metric %q", ErrInvalidArgument, spec.MetricName)
+		}
+		for _, aggregation := range spec.Aggregations {
+			if err := (AggregateQuery{
+				Query:          Query{MetricName: spec.MetricName, Start: q.Start, End: q.End, Tags: q.Tags, Order: q.Order},
+				Aggregation:    aggregation,
+				Interval:       spec.Interval,
+				PreserveSeries: spec.PreserveSeries,
+			}).Validate(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (q BatchSeriesQuery) normalized() BatchSeriesQuery {
+	q.Start = q.Start.UTC()
+	q.End = q.End.UTC()
+	if q.Order == "" {
+		q.Order = OrderAsc
+	}
+	return q
+}
+
 // AggregateQuery describes a bucketed aggregate query.
 //
 // AggregateQuery 描述按固定时间间隔分桶后的聚合查询。
@@ -341,10 +450,13 @@ type AggregateQuery struct {
 	//
 	// Interval 是每个聚合桶的宽度。
 	Interval time.Duration `json:"interval"`
-	// FillEmpty emits zero-count buckets for empty intervals.
+	// PreserveSeries keeps entity/tag identities as separate aggregate series on
+	// rollup-backed reads. The default preserves the historical rollup behavior
+	// of merging all matched series into each output bucket.
 	//
-	// FillEmpty 会为空时间段输出零计数桶。
-	FillEmpty bool `json:"fill_empty,omitempty"`
+	// PreserveSeries 在基于 rollup 的读取中保留 entity/tag 维度为独立聚合序列。
+	// 默认值保留历史 rollup 行为：把匹配到的序列合并进同一个输出桶。
+	PreserveSeries bool `json:"preserve_series,omitempty"`
 	// BucketLimit and BucketOffset page over the produced aggregate buckets, not
 	// the underlying raw points. They are applied consistently across every
 	// backend and aggregation type. The embedded Query.Limit/Query.Offset are
@@ -412,11 +524,15 @@ type AggregatePoint struct {
 	//
 	// Count 是该桶代表的点数量。
 	Count int `json:"count"`
+	// Tags identify the logical series represented by the bucket.
+	//
+	// Tags 标识该聚合桶所属的逻辑序列。
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // Stats stores or computes summary statistics for a point series.
 //
-// Stats 表示一段原始点序列的统计摘要。
+// Stats 表示一段指标序列的统计摘要。
 type Stats struct {
 	// Count is the number of points in the series.
 	//

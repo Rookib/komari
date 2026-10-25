@@ -2,16 +2,17 @@ package notifier
 
 import (
 	"fmt"
-	"html"
-	"log/slog"
 	"math"
 	"strings"
 	"time"
 
 	"github.com/komari-monitor/komari/database/clients"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/config"
+	messageevent "github.com/komari-monitor/komari/database/models/messageEvent"
+	"github.com/komari-monitor/komari/internal/config"
+	logger "github.com/komari-monitor/komari/utils/log"
 	"github.com/komari-monitor/komari/utils/messageSender"
+	"github.com/komari-monitor/komari/utils/officialtraffic"
 	agent_runtime "github.com/komari-monitor/komari/web/agent"
 	cache "github.com/patrickmn/go-cache"
 )
@@ -30,7 +31,7 @@ func CheckTraffic() {
 	}
 	cfg, err := config.GetAs[float64](config.TrafficLimitPercentageKey, 80.0)
 	if err != nil {
-		slog.Error("failed to get traffic limit percentage", "error", err)
+		logger.Error("notifier", "failed to get traffic limit percentage", "error", err)
 	}
 
 	if cfg <= 0 {
@@ -53,22 +54,32 @@ func CheckTraffic() {
 	}
 
 	for _, c := range allClients {
-		if c.TrafficLimit <= 0 {
-			continue
-		}
-
 		r, ok := reports[c.UUID]
 		if !ok || r == nil {
 			continue
 		}
 
-		// 计算不同类型的使用值
-		used := ComputeUsedByType(strings.ToLower(c.TrafficLimitType), r.Network.TotalUp, r.Network.TotalDown)
+		// 计算不同类型的使用值；如配置官方流量源，则优先以官方周期用量/上限判断阈值。
+		up := r.Network.TotalUp
+		down := r.Network.TotalDown
+		limit := c.TrafficLimit
+		sourceName := ""
+		used := ComputeUsedByType(strings.ToLower(c.TrafficLimitType), up, down)
+		if snapshot, ok := officialtraffic.GetSnapshot(c); ok && snapshot.UsedBytes > 0 {
+			used = snapshot.UsedBytes
+			if snapshot.LimitBytes > 0 {
+				limit = snapshot.LimitBytes
+			}
+			sourceName = snapshot.SourceName
+		}
 		if used <= 0 {
 			continue
 		}
 
-		pct := float64(used) / float64(c.TrafficLimit) * 100.0
+		if limit <= 0 {
+			continue
+		}
+		pct := float64(used) / float64(limit) * 100.0
 		if pct < startThreshold {
 			continue
 		}
@@ -93,23 +104,29 @@ func CheckTraffic() {
 
 		if curStep > lastStep { // 只在进入新步进时提醒一次
 			trafficCache.SetDefault(key, curStep)
-			method, _ := config.GetAs[string](config.NotificationMethodKey, "none")
-			if method == "telegram" {
+			if messageSender.IsProviderConfigured("telegram") {
 				name := c.Name
 				if strings.TrimSpace(name) == "" {
 					name = c.UUID
 				}
-				msg := fmt.Sprintf("🖥️ 机器: <b>%s</b>\n🔼 上传: %s\n🔽 下载: %s\n📊 已用: <b>%s</b> / %s（%d%%）", html.EscapeString(name), humanBytes(r.Network.TotalUp), humanBytes(r.Network.TotalDown), humanBytes(used), humanBytes(c.TrafficLimit), curStep)
+				sourceLine := ""
+				if sourceName != "" {
+					sourceLine = fmt.Sprintf("\n📡 来源: %s", sourceName)
+				}
+				msg := fmt.Sprintf("🖥️ 机器: %s%s\n🔼 上传: %s\n🔽 下载: %s\n📊 已用: %s / %s（%d%%）", name, sourceLine, humanBytes(up), humanBytes(down), humanBytes(used), humanBytes(limit), curStep)
 				_ = messageSender.SendTextMessage(msg, "")
 				continue
 			}
 
-			msg := fmt.Sprintf("used %d%% (%s / %s), type=%s", curStep, humanBytes(used), humanBytes(c.TrafficLimit), strings.ToLower(c.TrafficLimitType))
+			msg := fmt.Sprintf("used %d%% (%s / %s), type=%s", curStep, humanBytes(used), humanBytes(limit), strings.ToLower(c.TrafficLimitType))
+			if sourceName != "" {
+				msg += ", source=" + sourceName
+			}
 			// 发送通知（内部会检查 NotificationEnabled）
-			_ = messageSender.SendEvent(models.EventMessage{
-				Event:   "Traffic",
+			_ = messageSender.SendNotification(models.EventMessage{
+				Event:   messageevent.Traffic,
 				Clients: []models.Client{c},
-				Time:    time.Now(),
+				Time:    time.Now().UTC(),
 				Emoji:   "⚠️",
 				Message: msg,
 			})

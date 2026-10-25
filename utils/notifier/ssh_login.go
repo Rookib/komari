@@ -9,9 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/komari-monitor/komari/database/clients"
 	"github.com/komari-monitor/komari/database/models"
-	messageevent "github.com/komari-monitor/komari/database/models/messageEvent"
+	"github.com/komari-monitor/komari/database/sshlogin"
 	v2 "github.com/komari-monitor/komari/protocol/v2"
 	"github.com/komari-monitor/komari/utils/messageSender"
 	cache "github.com/patrickmn/go-cache"
@@ -67,15 +68,72 @@ func NotifySSHLogin(clientUUID string, params v2.SSHLoginParams) error {
 	if err != nil {
 		return err
 	}
+	notificationConfig, err := sshlogin.GetNotification(clientUUID)
+	if err != nil {
+		return err
+	}
+	if !notificationConfig.Enable {
+		return nil
+	}
+	whitelisted := notificationConfig.IsIPWhitelisted(params.RemoteIP)
+	if err := sshlogin.CreateEvent(models.SSHLoginEvent{
+		ID:          uuid.New().String(),
+		Client:      clientUUID,
+		User:        params.User,
+		RemoteIP:    params.RemoteIP,
+		RemotePort:  params.RemotePort,
+		AuthMethod:  params.AuthMethod,
+		OccurredAt:  (occurredAt),
+		CreatedAt:   time.Now().UTC(),
+		Whitelisted: whitelisted,
+	}); err != nil {
+		return err
+	}
+	if whitelisted {
+		return nil
+	}
 	event := models.EventMessage{
-		Event:   messageevent.Login,
+		Event:   "SSH 登录成功",
 		Clients: []models.Client{client},
 		Time:    occurredAt,
 		Emoji:   "🔐",
-		Message: fmt.Sprintf("SSH login succeeded\nUser: %s\nSource: %s:%d\nAuthentication: %s", params.User, params.RemoteIP, params.RemotePort, params.AuthMethod),
+		Message: formatSSHLoginMessage(params, occurredAt),
 	}
 	go sendSSHLoginNotifications(event)
 	return nil
+}
+
+func formatSSHLoginMessage(params v2.SSHLoginParams, occurredAt time.Time) string {
+	return fmt.Sprintf(
+		"👤 登录账户：%s\n🌐 来源地址：%s\n💻 登录终端：ssh\n🔑 认证方式：%s\n\n🕒 登录时间：%s",
+		params.User,
+		params.RemoteIP,
+		formatSSHAuthMethod(params.AuthMethod),
+		formatBeijingTime(occurredAt),
+	)
+}
+
+func formatSSHAuthMethod(method string) string {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "publickey":
+		return "密钥"
+	case "password":
+		return "密码"
+	case "keyboard-interactive":
+		return "交互式"
+	case "hostbased":
+		return "主机认证"
+	default:
+		return method
+	}
+}
+
+func formatBeijingTime(t time.Time) string {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		loc = time.FixedZone("CST", 8*60*60)
+	}
+	return t.In(loc).Format("2006-01-02 15:04:05 北京时间")
 }
 
 func allowSSHLoginEvent(clientUUID string, now time.Time) bool {

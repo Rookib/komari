@@ -14,32 +14,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      #- name: Create dummy index.html
-      #  run: |
-      #    mkdir -p web/public/defaultTheme/dist
-      #    echo "<html><body><h1>This is komari development server.</h1></body></html>" > web/public/defaultTheme/dist/index.html
-
       - name: Clone and build frontend
-        run: |
-          git clone https://github.com/komari-monitor/komari-web komari-web
-          cd komari-web
-          npm install
-          npm run build
-          cd ..
-          mkdir -p web/public/defaultTheme/dist
-          rm -rf web/public/defaultTheme/dist/*
-          cp -r komari-web/dist/* web/public/defaultTheme/dist/
-          cp -f komari-web/komari-theme.json web/public/defaultTheme/
-          if [ -f komari-web/preview.png ]; then cp -f komari-web/preview.png web/public/defaultTheme/; fi
-          if [ -f komari-web/perview.png ]; then cp -f komari-web/perview.png web/public/defaultTheme/; fi
-          # Compatibility: ensure both filenames exist if only one is present
-          if [ -f web/public/defaultTheme/preview.png ] && [ ! -f web/public/defaultTheme/perview.png ]; then cp -f web/public/defaultTheme/preview.png web/public/defaultTheme/perview.png; fi
-          if [ -f web/public/defaultTheme/perview.png ] && [ ! -f web/public/defaultTheme/preview.png ]; then cp -f web/public/defaultTheme/perview.png web/public/defaultTheme/preview.png; fi
+        uses: ./.github/actions/build-frontend
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"
 
       - name: Build application
         env:
@@ -47,7 +28,7 @@ jobs:
           GOARCH: amd64
         run: |
           VERSION_SHA="${{ github.sha }}"
-          go build -ldflags "-X github.com/komari-monitor/komari/utils.CurrentVersion=dev -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_SHA}" -o komari .
+          go build -ldflags "-s -w -extldflags=-Wl,--strip-all -X github.com/komari-monitor/komari/utils.CurrentVersion=dev -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_SHA}" -o komari .
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4

@@ -1,89 +1,79 @@
 package telegram
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/komari-monitor/komari/utils/messageSender"
+	"github.com/komari-monitor/komari/utils/messageSender/outboundhttp"
+	"html"
+	"io"
 	"net/http"
 	"net/url"
-
-	"github.com/komari-monitor/komari/utils/messageSender/factory"
+	"strings"
+	"time"
 )
 
-type TelegramSender struct {
-	Addition
-}
+type TelegramSender struct{ Addition }
 
-func (t *TelegramSender) GetName() string {
-	return "telegram"
+func Register() error {
+	return messageSender.RegisterNotificationChannel("telegram", messageSender.ManagedConfiguration("Telegram", Addition{}), &TelegramSender{})
 }
-
-func (t *TelegramSender) GetConfiguration() factory.Configuration {
-	return &t.Addition
-}
-
-func (t *TelegramSender) Init() error {
-	// 初始化逻辑，如果需要的话
-	return nil
-}
-
-func (t *TelegramSender) Destroy() error {
-	// 清理逻辑，如果需要的话
-	return nil
-}
-
-func (t *TelegramSender) SendTextMessage(message, title string) error {
-	fullMessage := message
-	if title != "" {
-		fullMessage = fmt.Sprintf("<b>%s</b>\n%s", title, message)
+func (t *TelegramSender) Unload() error { return nil }
+func (t *TelegramSender) Send(ctx context.Context, n messageSender.Notification, values map[string]any) error {
+	var addition Addition
+	if err := messageSender.DecodeConfiguration(values, &addition); err != nil {
+		return err
 	}
-
+	sender := TelegramSender{Addition: addition}
+	return sender.send(ctx, n.Message, n.Title)
+}
+func (t *TelegramSender) send(ctx context.Context, message, title string) error {
+	if strings.TrimSpace(t.BotToken) == "" || strings.TrimSpace(t.ChatID) == "" {
+		return errors.New("Telegram is not fully configured")
+	}
+	fullMessage := html.EscapeString(message)
+	if title != "" {
+		fullMessage = fmt.Sprintf("<b>%s</b>\n%s", html.EscapeString(title), fullMessage)
+	}
 	if fullMessage == "" {
 		return errors.New("message is empty")
 	}
-
-	endpoint := t.Addition.Endpoint + t.Addition.BotToken + "/sendMessage"
-
-	data := url.Values{}
-	data.Set("chat_id", t.Addition.ChatID)
-	data.Set("text", fullMessage)
-	data.Set("parse_mode", "HTML")
-
-	// Add message_thread_id if provided
-	if t.Addition.MessageThreadID != "" {
-		data.Set("message_thread_id", t.Addition.MessageThreadID)
+	endpoint := strings.TrimRight(strings.TrimSpace(t.Endpoint), "/")
+	if endpoint == "" {
+		endpoint = "https://api.telegram.org/bot"
 	}
-
-	resp, err := http.PostForm(endpoint, data)
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("Telegram endpoint must be an HTTPS URL without credentials, query or fragment")
+	}
+	data := url.Values{"chat_id": {t.ChatID}, "text": {fullMessage}, "parse_mode": {"HTML"}}
+	if t.MessageThreadID != "" {
+		data.Set("message_thread_id", t.MessageThreadID)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+t.BotToken+"/sendMessage", strings.NewReader(data.Encode()))
 	if err != nil {
-		return fmt.Errorf("failed to send message: %v", err)
+		return errors.New("invalid Telegram request")
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	client := outboundhttp.NewClient(30 * time.Second)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.New("Telegram request failed")
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API returned non-OK status: %d", resp.StatusCode)
-	}
-
 	var result struct {
-		Ok          bool   `json:"ok"`
-		Description string `json:"description"`
+		OK bool `json:"ok"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+		return errors.New("invalid Telegram response")
 	}
-
-	if !result.Ok {
-		return fmt.Errorf("telegram API error: %s", result.Description)
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		return fmt.Errorf("Telegram rejected notification (HTTP %d)", resp.StatusCode)
 	}
-
 	return nil
 }
 
-func init() {
-	factory.RegisterMessageSender(func() factory.IMessageSender {
-		return &TelegramSender{}
-	})
-}
-
-// 确保实现了 IMessageSender 接口
-var _ factory.IMessageSender = (*TelegramSender)(nil)
+var _ messageSender.NotificationChannel = (*TelegramSender)(nil)

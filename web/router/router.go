@@ -1,12 +1,17 @@
 package router
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/web/api"
 	"github.com/komari-monitor/komari/web/api/admin"
 	"github.com/komari-monitor/komari/web/api/client"
+	officialtrafficapi "github.com/komari-monitor/komari/web/api/officialtraffic"
 	public_api "github.com/komari-monitor/komari/web/api/public"
+	"github.com/komari-monitor/komari/web/api/securityconsole"
 	"github.com/komari-monitor/komari/web/api/terminal"
+	"github.com/komari-monitor/komari/web/filemanager"
 	"github.com/komari-monitor/komari/web/public"
 	jsonRpc "github.com/komari-monitor/komari/web/rpc/jsonrpc"
 )
@@ -19,14 +24,33 @@ func Register(r *gin.Engine) {
 	r.Any("/ping", func(c *gin.Context) {
 		c.String(200, "pong")
 	})
+	r.GET("/admin", func(c *gin.Context) {
+		c.Redirect(http.StatusFound, "/admin/dashboard")
+	})
 
 	registerPublicRoutes(r)
 	registerAgentRoutes(r)
 	registerAdminRoutes(r)
+	registerSecurityRoutes(r)
 
 	public.Static(r.Group("/"), func(handlers ...gin.HandlerFunc) {
 		r.NoRoute(handlers...)
 	})
+}
+
+// registerSecurityRoutes adds a minimal, admin-only security console without
+// changing the existing SPA build or WebSocket/RPC architecture.
+func registerSecurityRoutes(r *gin.Engine) {
+	r.GET("/security/dashboard", api.RequireRole(api.RoleAdmin), securityconsole.Dashboard)
+
+	g := r.Group("/api/security", api.RequireRole(api.RoleAdmin))
+	{
+		g.GET("/events", securityconsole.ListEvents)
+		g.GET("/attacks", securityconsole.ListAttacks)
+		g.POST("/ban", securityconsole.BanIP)
+		g.POST("/unban", securityconsole.UnbanIP)
+		g.POST("/whitelist", securityconsole.WhitelistIP)
+	}
 }
 
 // registerPublicRoutes 公开路由。JSON 读接口经 Bind 绑定到 public: 命名空间方法。
@@ -36,7 +60,12 @@ func registerPublicRoutes(r *gin.Engine) {
 	r.GET("/api/logout", public_api.Logout)
 	r.GET("/api/oauth", public_api.OAuth)
 	r.GET("/api/oauth_callback", public_api.OAuthCallback)
-	r.GET("/api/mjpeg_live", public_api.MjpegLiveHandler)
+	r.POST("/api/public/theme-mode", public_api.UpdateThemeMode)
+	// 插件公开页面（visibility=public 的 iframe 页面），无需鉴权。
+	r.GET("/api/plugin/:short/*filepath", public_api.ServePluginFile)
+	// 短期文件预览令牌公开下载入口，供 Office 在线预览等服务端抓取。
+	r.GET("/api/preview/client/:uuid/file/download", filemanager.PreviewDownload)
+	r.HEAD("/api/preview/client/:uuid/file/download", filemanager.PreviewDownload)
 	// /api/clients 是 WebSocket 端点（客户端发 "get"/"get <uuid>" 拉取在线列表与最新上报），
 	// 非 JSON-RPC，保留为 WS handler。
 	r.GET("/api/clients", api.GetClients)
@@ -46,6 +75,7 @@ func registerPublicRoutes(r *gin.Engine) {
 	r.GET("/api/nodes", jsonRpc.Bind("public:getNodesInformation"))
 	r.GET("/api/public", jsonRpc.Bind("public:getPublicSettings"))
 	r.GET("/api/version", jsonRpc.Bind("public:getVersion"))
+	r.POST("/api/official-traffic/cache", officialtrafficapi.UploadCache)
 	r.GET("/api/recent/:uuid", jsonRpc.Bind("public:getClientRecentRecords", jsonRpc.WithPath("uuid")))
 	r.GET("/api/records/load", jsonRpc.Bind("public:getRecordsByUUID", jsonRpc.WithQuery("uuid", "load_type", "hours")))
 	r.GET("/api/records/ping", jsonRpc.Bind("public:getPingRecords", jsonRpc.WithQuery("uuid", "task_id", "hours")))
@@ -61,30 +91,37 @@ func registerAgentRoutes(r *gin.Engine) {
 	// AutoDiscovery 注册使用独立的 Authorization key 鉴权，保留 REST handler。
 	r.POST("/api/clients/register", client.RegisterClient)
 
-	tokenAuthorized := r.Group("/api/clients", api.RequireRole(api.RoleAdmin, api.RoleClient))
+	tokenAuthorized := r.Group("/api/clients", api.RequireRole(api.RoleClient))
 	{
 		// 上报类（WS / 原始流 / 兼容协议）保留 REST handler。
-		tokenAuthorized.GET("/report", client.WebSocketReport)
-		tokenAuthorized.POST("/uploadBasicInfo", client.UploadBasicInfo)
-		tokenAuthorized.POST("/report", client.UploadReport)
+		tokenAuthorized.POST("/ssh-auth-guard", client.UploadSSHAuthGuardAlert)
+		tokenAuthorized.GET("/security-actions", client.ListSecurityActions)
+		tokenAuthorized.POST("/security-actions/ack", client.AckSecurityAction)
+		// Agent 上报统一使用 v2 JSON-RPC。
 		tokenAuthorized.GET("/v2/rpc", client.WebSocketV2RPC)
 		tokenAuthorized.POST("/v2/rpc", client.UploadV2RPC)
+		// File data uses a short-lived, raw HTTP stream opened by a file RPC.
+		tokenAuthorized.GET("/transfer/:id", filemanager.AgentTransfer)
+		tokenAuthorized.POST("/transfer/:id", filemanager.AgentTransfer)
 		tokenAuthorized.GET("/terminal", terminal.EstablishConnection)
-
-		// JSON 接口 -> RPC2 (client: 命名空间)。
-		tokenAuthorized.POST("/task/result", jsonRpc.Bind("client:taskResult", jsonRpc.WithRaw()))
-		tokenAuthorized.GET("/ping/tasks", jsonRpc.Bind("client:getPingTasks", jsonRpc.WithRaw()))
-		tokenAuthorized.POST("/ping/result", jsonRpc.Bind("client:uploadPingResult", jsonRpc.WithRaw()))
 	}
 }
 
 // registerAdminRoutes 管理员路由。除二进制/流类外全部经 Bind 绑定到 admin: 命名空间方法。
 func registerAdminRoutes(r *gin.Engine) {
 	g := r.Group("/api/admin", api.RequireRole(api.RoleAdmin))
+	admin.RegisterPprofRoutes(g)
 
 	// --- 二进制/流/重定向类，保留 REST handler ---
 	g.GET("/download/backup", admin.DownloadBackup)
-	g.POST("/upload/backup", admin.UploadBackup)
+	uploadHandler := admin.NewArchiveUploadHandler()
+	uploadGroup := g.Group("/upload")
+	{
+		uploadGroup.POST("/init", uploadHandler.Init)
+		uploadGroup.POST("/chunk", uploadHandler.Chunk)
+		uploadGroup.POST("/merge", uploadHandler.Merge)
+		uploadGroup.POST("/cancel", uploadHandler.Cancel)
+	}
 	g.GET("/test/geoip", jsonRpc.Bind("admin:testGeoip", jsonRpc.WithQuery("ip")))
 	g.POST("/test/sendMessage", jsonRpc.Bind("admin:testSendMessage"))
 	g.POST("/update/mmdb", admin.UpdateMmdbGeoIP)
@@ -92,16 +129,21 @@ func registerAdminRoutes(r *gin.Engine) {
 	g.PUT("/update/favicon", admin.UploadFavicon)
 	g.POST("/update/favicon", admin.DeleteFavicon)
 
-	// theme 含文件上传，保留 REST handler。
+	// theme 的安装流程通过统一的分片上传接口；其余主题接口保留 REST handler。
 	theme := g.Group("/theme")
 	{
-		theme.PUT("/upload", admin.UploadTheme)
 		theme.GET("/list", admin.ListThemes)
 		theme.POST("/delete", admin.DeleteTheme)
 		theme.GET("/set", admin.SetTheme)
 		theme.POST("/update", admin.UpdateTheme)
 		theme.POST("/import", admin.ImportTheme)
 		theme.POST("/settings", admin.UpdateThemeSettings)
+		theme.GET("/market/sources", admin.ListThemeMarketSources)
+		theme.POST("/market/sources", admin.CreateThemeMarketSource)
+		theme.PUT("/market/sources/:id", admin.UpdateThemeMarketSource)
+		theme.DELETE("/market/sources/:id", admin.DeleteThemeMarketSource)
+		theme.GET("/market/catalog", admin.ListThemeMarketCatalog)
+		theme.POST("/market/install", admin.InstallThemeFromMarket)
 	}
 
 	// 2FA 含二维码 PNG / 敏感操作，保留 REST handler。
@@ -137,16 +179,15 @@ func registerAdminRoutes(r *gin.Engine) {
 	{
 		settings.GET("/", jsonRpc.Bind("admin:getSettings"))
 		settings.POST("/", jsonRpc.Bind("admin:editSettings"))
-		settings.GET("/xtermjs", jsonRpc.Bind("admin:getXtermjsSettings"))
-		settings.POST("/xtermjs", jsonRpc.Bind("admin:setXtermjsSettings", jsonRpc.WithMessage("settings saved")))
 		settings.POST("/oidc", jsonRpc.Bind("admin:setOidcProvider"))
 		settings.GET("/oidc", jsonRpc.Bind("admin:getOidcProvider", jsonRpc.WithQuery("provider")))
-		settings.POST("/message-sender", jsonRpc.Bind("admin:setMessageSenderProvider"))
-		settings.GET("/message-sender", jsonRpc.Bind("admin:getMessageSenderProvider", jsonRpc.WithQuery("provider")))
-		settings.GET("/cloudflared", jsonRpc.Bind("admin:getCloudflaredStatus"))
-		settings.POST("/cloudflared/start", jsonRpc.Bind("admin:startCloudflared"))
-		settings.POST("/cloudflared/stop", jsonRpc.Bind("admin:stopCloudflared"))
-		settings.POST("/cloudflared/remove-token", jsonRpc.Bind("admin:removeCloudflaredToken"))
+	}
+
+	// database storage inspection and maintenance
+	databaseGroup := g.Group("/database")
+	{
+		databaseGroup.GET("/size", jsonRpc.Bind("admin:getDatabaseSize"))
+		databaseGroup.POST("/vacuum", jsonRpc.Bind("admin:vacuumDatabase"))
 	}
 
 	// clients
@@ -159,7 +200,14 @@ func registerAdminRoutes(r *gin.Engine) {
 		clientGroup.POST("/:uuid/remove", jsonRpc.Bind("admin:removeClient", jsonRpc.WithPath("uuid")))
 		clientGroup.GET("/:uuid/token", jsonRpc.Bind("admin:getClientToken", jsonRpc.WithPath("uuid"), jsonRpc.WithFlat()))
 		clientGroup.POST("/order", jsonRpc.Bind("admin:orderClients"))
-		clientGroup.GET("/:uuid/terminal", api.RequireSensitive2FA(), terminal.RequestTerminal)
+		// RequestTerminal validates 2FA only when creating a new session. Reattach
+		// requests are authenticated against the existing session owner so a short
+		// network flap does not depend on the current TOTP window.
+		clientGroup.GET("/:uuid/terminal", terminal.RequestTerminal)
+		clientGroup.POST("/:uuid/file/upload", filemanager.Upload)
+		clientGroup.GET("/:uuid/file/download", filemanager.Download)
+		clientGroup.HEAD("/:uuid/file/download", filemanager.Download)
+		clientGroup.GET("/:uuid/file/preview-token", filemanager.CreatePreviewToken)
 	}
 
 	// records
@@ -179,37 +227,50 @@ func registerAdminRoutes(r *gin.Engine) {
 
 	g.GET("/logs", jsonRpc.Bind("admin:getLogs", jsonRpc.WithQuery("limit", "page")))
 
-	// clipboard
-	clipboardGroup := g.Group("/clipboard")
+	// plugins: 安装流程通过统一的分片上传接口，启停/列表/日志走 RPC2，市场对齐主题市场。
+	pluginGroup := g.Group("/plugin")
 	{
-		clipboardGroup.GET("/:id", jsonRpc.Bind("admin:getClipboard", jsonRpc.WithPath("id")))
-		clipboardGroup.GET("", jsonRpc.Bind("admin:listClipboard"))
-		clipboardGroup.POST("", jsonRpc.Bind("admin:createClipboard"))
-		clipboardGroup.POST("/:id", jsonRpc.Bind("admin:updateClipboard", jsonRpc.WithPath("id")))
-		clipboardGroup.POST("/remove", jsonRpc.Bind("admin:batchDeleteClipboard"))
-		clipboardGroup.POST("/:id/remove", jsonRpc.Bind("admin:deleteClipboard", jsonRpc.WithPath("id")))
+		pluginGroup.GET("/list", jsonRpc.Bind("admin:listPlugins"))
+		pluginGroup.POST("/enabled", jsonRpc.Bind("admin:setPluginEnabled"))
+		pluginGroup.GET("/logs", jsonRpc.Bind("admin:getPluginLogs", jsonRpc.WithQuery("short")))
+		pluginGroup.GET("/market/sources", admin.ListPluginMarketSources)
+		pluginGroup.POST("/market/sources", admin.CreatePluginMarketSource)
+		pluginGroup.PUT("/market/sources/:id", admin.UpdatePluginMarketSource)
+		pluginGroup.DELETE("/market/sources/:id", admin.DeletePluginMarketSource)
+		pluginGroup.GET("/market/catalog", admin.ListPluginMarketCatalog)
+		pluginGroup.POST("/market/install", admin.InstallPluginFromMarket)
+		pluginGroup.POST("/delete", jsonRpc.Bind("admin:deletePlugin"))
+		pluginGroup.GET("/configuration", jsonRpc.Bind("admin:getPluginConfiguration", jsonRpc.WithQuery("short")))
+		pluginGroup.POST("/configuration", jsonRpc.Bind("admin:setPluginConfiguration"))
+		// 插件注入的管理页面静态文件
+		pluginGroup.GET("/:short/*filepath", admin.ServePluginFile)
 	}
 
 	// notifications
 	notificationGroup := g.Group("/notification")
 	{
+		notificationGroup.GET("/channels", jsonRpc.Bind("admin:listNotificationChannels"))
+		notificationGroup.GET("/channel/configuration", jsonRpc.Bind("admin:getNotificationChannelConfiguration", jsonRpc.WithQuery("id")))
+		notificationGroup.POST("/channel/configuration", jsonRpc.Bind("admin:setNotificationChannelConfiguration"))
 		notificationGroup.GET("/offline", jsonRpc.Bind("admin:listOfflineNotifications"))
 		notificationGroup.POST("/offline/edit", jsonRpc.Bind("admin:editOfflineNotification"))
 		notificationGroup.POST("/offline/enable", jsonRpc.Bind("admin:enableOfflineNotification"))
 		notificationGroup.POST("/offline/disable", jsonRpc.Bind("admin:disableOfflineNotification"))
-		loadAlert := notificationGroup.Group("/load")
-		{
-			loadAlert.GET("/", jsonRpc.Bind("admin:getAllLoadNotifications"))
-			loadAlert.POST("/add", jsonRpc.Bind("admin:addLoadNotification"))
-			loadAlert.POST("/delete", jsonRpc.Bind("admin:deleteLoadNotification"))
-			loadAlert.POST("/edit", jsonRpc.Bind("admin:editLoadNotification"))
-		}
 		trafficReport := notificationGroup.Group("/traffic-report")
 		{
 			trafficReport.GET("/", jsonRpc.Bind("admin:listTrafficReportNotifications"))
 			trafficReport.POST("/edit", jsonRpc.Bind("admin:editTrafficReportNotifications"))
 			trafficReport.POST("/enable", jsonRpc.Bind("admin:enableTrafficReportNotifications"))
 			trafficReport.POST("/disable", jsonRpc.Bind("admin:disableTrafficReportNotifications"))
+		}
+		sshLogin := notificationGroup.Group("/ssh-login")
+		{
+			sshLogin.GET("/", jsonRpc.Bind("admin:listSSHLoginNotifications"))
+			sshLogin.POST("/edit", jsonRpc.Bind("admin:editSSHLoginNotifications"))
+			sshLogin.POST("/enable", jsonRpc.Bind("admin:enableSSHLoginNotifications"))
+			sshLogin.POST("/disable", jsonRpc.Bind("admin:disableSSHLoginNotifications"))
+			sshLogin.GET("/events", jsonRpc.Bind("admin:listSSHLoginEvents", jsonRpc.WithQuery("client", "limit")))
+			sshLogin.POST("/events/delete", jsonRpc.Bind("admin:deleteSSHLoginEvents"))
 		}
 	}
 

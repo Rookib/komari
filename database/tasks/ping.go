@@ -1,10 +1,13 @@
 package tasks
 
 import (
+	"context"
+	"sort"
 	"time"
 
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
+	"github.com/komari-monitor/komari/internal/metricstore"
 	"github.com/komari-monitor/komari/utils"
 	"gorm.io/gorm"
 )
@@ -45,6 +48,12 @@ func AddPingTask(clients []string, defaultOn bool, name string, target, task_typ
 }
 
 func DeletePingTask(id []uint) error {
+	// The metric store is independent from the main database, so clean it first
+	// to avoid leaving history that can no longer be addressed through the task.
+	if err := DeletePingRecords(id); err != nil {
+		return err
+	}
+
 	db := dbcore.GetDBInstance()
 	result := db.Where("id IN ?", id).Delete(&models.PingTask{})
 	if result.RowsAffected == 0 {
@@ -98,22 +107,41 @@ func GetAllPingTasks() ([]models.PingTask, error) {
 func GetPingTasksByClient(uuid string) []models.PingTask {
 	db := dbcore.GetDBInstance()
 	var tasks []models.PingTask
-	if err := db.Where("clients LIKE ?", `%"`+uuid+`"%`).Find(&tasks).Error; err != nil {
+	if err := db.Where("clients LIKE ?", `%"`+uuid+`"%`).Order("weight ASC").Order("id ASC").Find(&tasks).Error; err != nil {
 		return nil
 	}
 	return tasks
 }
 
 func UpdatePingTaskOrder(order map[uint]int) error {
+	if len(order) == 0 {
+		return nil
+	}
+
 	db := dbcore.GetDBInstance()
 	err := db.Transaction(func(tx *gorm.DB) error {
-		for id, weight := range order {
+		// Validate all ids before changing any weights. The update response is
+		// not a reliable existence check because some drivers report zero rows
+		// when the new value equals the current value.
+		ids := make([]uint, 0, len(order))
+		for id := range order {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+		var existing int64
+		if err := tx.Model(&models.PingTask{}).Where("id IN ?", ids).Count(&existing).Error; err != nil {
+			return err
+		}
+		if existing != int64(len(ids)) {
+			return gorm.ErrRecordNotFound
+		}
+
+		for _, id := range ids {
+			weight := order[id]
 			result := tx.Model(&models.PingTask{}).Where("id = ?", id).Update("weight", weight)
 			if result.Error != nil {
 				return result.Error
-			}
-			if result.RowsAffected == 0 {
-				return gorm.ErrRecordNotFound
 			}
 		}
 		return nil
@@ -125,38 +153,24 @@ func UpdatePingTaskOrder(order map[uint]int) error {
 	return nil
 }
 
-func SavePingRecord(record models.PingRecord) error {
-	db := dbcore.GetDBInstance()
-	return db.Create(&record).Error
-}
+// ping 记录已完全迁移到 metric store（指标 ping.latency_ms），运行期读写全部走
+// metric store，旧 ping_records 表不再参与。
 
-func DeletePingRecordsBefore(time time.Time) error {
-	db := dbcore.GetDBInstance()
-	err := db.Where("time < ?", time).Delete(&models.PingRecord{}).Error
-	return err
+func SavePingRecord(record models.PingRecord) error {
+	return metricstore.WritePingRecord(context.Background(), record)
 }
 
 func DeletePingRecords(id []uint) error {
-	db := dbcore.GetDBInstance()
-	result := db.Where("task_id IN ?", id).Delete(&models.PingRecord{})
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return result.Error
+	return metricstore.DeletePingRecordsByTask(context.Background(), id)
 }
 
 func DeleteAllPingRecords() error {
-	db := dbcore.GetDBInstance()
-	result := db.Exec("DELETE FROM ping_records")
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return result.Error
+	return metricstore.DeleteAllPingRecords(context.Background())
 }
+
 func ReloadPingSchedule() error {
-	db := dbcore.GetDBInstance()
-	var pingTasks []models.PingTask
-	if err := db.Find(&pingTasks).Error; err != nil {
+	pingTasks, err := GetAllPingTasks()
+	if err != nil {
 		return err
 	}
 	return utils.ReloadPingSchedule(pingTasks)
@@ -201,17 +215,5 @@ func AddDefaultOnClientUUID(uuid string) error {
 }
 
 func GetPingRecords(uuid string, taskId int, start, end time.Time) ([]models.PingRecord, error) {
-	db := dbcore.GetDBInstance()
-	var records []models.PingRecord
-	dbQuery := db.Model(&models.PingRecord{})
-	if uuid != "" {
-		dbQuery = dbQuery.Where("client = ?", uuid)
-	}
-	if taskId >= 0 {
-		dbQuery = dbQuery.Where("task_id = ?", uint(taskId))
-	}
-	if err := dbQuery.Where("time >= ? AND time <= ?", start, end).Order("time DESC").Find(&records).Error; err != nil {
-		return nil, err
-	}
-	return records, nil
+	return metricstore.GetPingRecords(context.Background(), uuid, taskId, start, end)
 }

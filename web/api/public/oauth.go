@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/database/accounts"
 	"github.com/komari-monitor/komari/database/auditlog"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/utils"
 	"github.com/komari-monitor/komari/web/oauth"
 )
@@ -86,7 +86,7 @@ func OAuthCallback(c *gin.Context) {
 			return
 		}
 		auditlog.Log(c.ClientIP(), user.UUID, "bound external account (OAuth)"+fmt.Sprintf(",sso_id: %s", sso_id), "login")
-		c.Redirect(302, "/admin")
+		c.Redirect(302, "/admin/dashboard")
 		return
 	}
 
@@ -110,5 +110,5 @@ func OAuthCallback(c *gin.Context) {
 	// 设置cookie并返回
 	setSessionCookie(c, session, sessionCookieMaxAge)
 	auditlog.Log(c.ClientIP(), user.UUID, "logged in (OAuth)", "login")
-	c.Redirect(302, "/admin")
+	c.Redirect(302, "/admin/dashboard")
 }

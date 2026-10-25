@@ -113,9 +113,9 @@ handler 退化为薄适配层：解析 gin 参数 → 调 RPC → 把响应映�
 
 | 命名空间 | 方法（文件） |
 | --- | --- |
-| `admin` | client CRUD、ping task、session/settings/weight、notification（load/offline/traffic）、clipboard、provider（messageSender/oidc）、task 查询、system（logs/cloudflared/exec/test）、xtermjs |
+| `admin` | client CRUD、ping task、session/settings/weight、notification（load/offline/traffic）、provider（messageSender/oidc）、task 查询、system（logs/cloudflared/exec/test） |
 | `public` | getMe、getNodesInformation、getPublicSettings、getVersion、getClientRecentRecords、getRecordsByUUID、getPingRecords、getPublicPingTasks |
-| `client` | getPingTasks、uploadPingResult、taskResult |
+| Agent v2 | `agent.report`、`agent.basicInfo`、`agent.pingResult`、`agent.taskResult`、`agent.pull`（`/api/clients/v2/rpc`） |
 
 ### 声明式路由桥 `Bind`
 
@@ -130,12 +130,11 @@ r.GET("/api/admin/client/:uuid", jsonRpc.Bind("admin:getClient", jsonRpc.WithPat
   - 默认 `renderStandard` → `{status:"success", message, data}`（data 为空时省略，对齐 `api.Response`）。
   - `WithFlat()` → 把 result(map) 平铺到顶层 + `{status:"success"}`（addClient/getClientToken/getSessions/provider set）。
   - `WithRaw()` → 直接输出 result（agent 裸 JSON / me / listClients / getClient）。
-  - `WithMessage(msg)` → 成功带固定 message（xtermjs 保存）。
 - 错误：统一 `{status:"error", message}` + JSON-RPC 错误码到 HTTP 码映射。
 
 ### 保留为 REST 的接口（不走 RPC 桥）
 
 二进制/流/重定向/特殊鉴权类，集中在 `web/api/admin`（2fa/theme/backup/update/oauth 绑定）、
-`web/api/public`（login/logout/oauth/mjpeg）、`web/api/client`（report WS+POST、v2 RPC、uploadBasicInfo、terminal、AutoDiscovery 注册）。
+`web/api/public`（login/logout/oauth/plugin）、`web/api/client`（v2 RPC、terminal、AutoDiscovery 注册）。
 
-agent v1/v2 上报的核心逻辑已统一到 `web/api/client/ingest.go`。
+agent v2 上报的核心逻辑统一在 `web/api/client/ingest.go`。

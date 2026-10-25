@@ -8,7 +8,8 @@ import (
 	"github.com/komari-monitor/komari/database/accounts"
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/protocol/v1"
+	v2 "github.com/komari-monitor/komari/protocol/v2"
+	"github.com/komari-monitor/komari/utils/officialtraffic"
 	agent_runtime "github.com/komari-monitor/komari/web/agent"
 )
 
@@ -19,7 +20,7 @@ func GetClients(c *gin.Context) {
 		return
 	}
 	// Upgrade the HTTP connection to a WebSocket connection
-	conn, err := UpgradeWebSocket(c)
+	conn, err := UpgradeSafeConn(c, EnableWebSocketCompression)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "Failed to upgrade to WebSocket." + err.Error()})
 		return
@@ -53,15 +54,14 @@ func GetClients(c *gin.Context) {
 	for {
 		var resp struct {
 			Online []string             `json:"online"` // 已建立连接的客户端uuid列表
-			Data   map[string]v1.Report `json:"data"`   // 最后上报的数据
+			Data   map[string]v2.Report `json:"data"`   // 最后上报的数据
 		}
 
 		resp.Online = []string{}
-		resp.Data = map[string]v1.Report{}
+		resp.Data = map[string]v2.Report{}
 
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			//log.Println("Error reading message:", err)
 			return
 		}
 		message := string(data)
@@ -96,11 +96,13 @@ func GetClients(c *gin.Context) {
 				continue
 			}
 
-			report.UUID = "" // 不暴露 uuid
-			if report.CPU.Usage == 0 {
-				report.CPU.Usage = 0.01
+			out := *report
+			officialtraffic.ApplyReportOverride(key, &out)
+			out.UUID = "" // 不暴露 uuid
+			if out.CPU.Usage == 0 {
+				out.CPU.Usage = 0.01
 			}
-			resp.Data[key] = *report
+			resp.Data[key] = out
 		}
 
 		err = conn.WriteJSON(gin.H{"status": "success", "data": resp})

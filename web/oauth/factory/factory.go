@@ -1,7 +1,7 @@
 package factory
 
 import (
-	"log"
+	logger "github.com/komari-monitor/komari/utils/log"
 
 	"github.com/komari-monitor/komari/utils/item"
 )
@@ -19,7 +19,7 @@ func RegisterOidcProvider(constructor OidcConstructor) {
 		panic("OIDC provider constructor returned nil")
 	}
 	if _, exists := providers[provider.GetName()]; exists {
-		log.Println("OIDC provider already registered: " + provider.GetName())
+		logger.InfoArgs("oauth", "OIDC provider already registered: "+provider.GetName())
 	}
 	providers[provider.GetName()] = provider
 
@@ -42,18 +42,10 @@ func GetConstructor(name string) (OidcConstructor, bool) {
 	return constructor, exists
 }
 
-func GetAllOidcProviderNames() []string {
-	names := make([]string, 0, len(providers))
-	for name := range providers {
-		names = append(names, name)
-	}
-	return names
-}
-
 func Initialize() {
 	for _, provider := range providers {
 		if err := provider.Init(); err != nil {
-			log.Printf("Failed to initialize OIDC provider %s: %v", provider.GetName(), err)
+			logger.Errorf("oauth", "Failed to initialize OIDC provider %s: %v", provider.GetName(), err)
 		}
 	}
 }

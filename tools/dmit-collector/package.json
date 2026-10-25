@@ -1,0 +1,14 @@
+{
+  "name": "komari-dmit-official-traffic-collector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install-browser": "playwright install chromium",
+    "once": "node collector.js --once",
+    "verify": "node collector.js --verify"
+  },
+  "dependencies": {
+    "playwright": "^1.57.0"
+  }
+}

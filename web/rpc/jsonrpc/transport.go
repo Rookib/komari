@@ -6,16 +6,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/database/accounts"
-	"github.com/komari-monitor/komari/database/clients"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/pkg/rpc"
 	"github.com/komari-monitor/komari/web/api"
-	"github.com/komari-monitor/komari/web/connection"
 )
 
 // OnRpcRequest 是 /api/rpc2 的统一入口：GET 升级为 WebSocket，POST 处理单条/批量 JSON-RPC。
@@ -34,47 +31,72 @@ func OnRpcRequest(c *gin.Context) {
 }
 
 // CallFromGin 供传统 gin handler / 路由桥转调 RPC 方法。
-// 优先采用 IdentityMiddleware 已确立的角色（c.GetString("role")），其与路由的 RequireRole 一致；
-// 缺失时回退到 detectPermissionGroup 自行识别。再经统一 Dispatch 执行。
+// 复用 IdentityMiddleware 已识别的 principal；未识别时兜底调用 IdentifyPrincipal。
 func CallFromGin(c *gin.Context, method string, params any) *rpc.JsonRpcResponse {
-	group := c.GetString("role")
-	if group == "" {
-		group = detectPermissionGroup(c)
-	}
-	meta := buildContextMeta(c, group)
-	// API Key 等身份下 buildContextMeta 拿不到用户 UUID，回退到中间件已识别的值，
-	// 保证审计日志的 actor 与原有 REST 行为一致。
-	if meta.UserUUID == "" {
-		if v, ok := c.Get("uuid"); ok {
-			if s, ok := v.(string); ok {
-				meta.UserUUID = s
-			}
-		}
-	}
-	// 客户端 token 经 ?token= / body 传入时 buildContextMeta 取不到，
-	// 回退到 IdentityMiddleware 已解析的 client_uuid。
-	if meta.ClientUUID == "" {
-		if v, ok := c.Get("client_uuid"); ok {
-			if s, ok := v.(string); ok {
-				meta.ClientUUID = s
-			}
-		}
-	}
+	meta := buildContextMeta(c)
 	req := &rpc.JsonRpcRequest{Version: rpc.RPC_VERSION, Method: method, Params: params}
-	return Dispatch(c.Request.Context(), meta, req)
+	return dispatchWithSensitive(c.Request.Context(), c, meta, req)
+}
+
+// dispatchWithSensitive 在统一分发前对敏感方法补充二次验证，使各调用入口行为一致。
+// 对已通过命名空间权限校验的敏感方法，要求调用方满足敏感操作 2FA。
+// 校验基于 Principal(API Key 放行、未配置 2FA 的账号放行),Dispatch 仍为权威鉴权点。
+//
+// 2FA code 按"每请求"提取:优先取自本条 RPC 请求的 params(2fa_code/two_factor_code/otp),
+// 这对 WebSocket 长连接尤其重要——每条敏感消息携带新鲜的 TOTP 码,避免连接级握手码过期或被复用;
+// 缺失时回退到 X-2FA-Code / X-Two-Factor-Code 请求头与 query(REST/直连场景)。
+//
+// 若请求已被 RequireSensitive2FA 中间件校验过(sensitive_2fa_verified),则跳过,避免重复校验。
+func dispatchWithSensitive(ctx context.Context, c *gin.Context, meta *rpc.ContextMeta, req *rpc.JsonRpcRequest) *rpc.JsonRpcResponse {
+	if meta != nil && meta.Principal != nil && (c == nil || !c.GetBool("sensitive_2fa_verified")) &&
+		rpc.IsSensitive(req.Method) && rpc.CheckPrincipal(meta.Principal, req.Method) {
+		code := extractRequestTwoFACode(req)
+		if code == "" && c != nil {
+			code = headerOrQueryTwoFACode(c)
+		}
+		if err := api.VerifySensitive2FACore(meta.Principal.UserUUID, code, meta.Principal.IsAPIKey); err != nil {
+			return rpc.ErrorResponse(req.ID, rpc.PermissionDenied, err.Error(), nil)
+		}
+	}
+	return Dispatch(ctx, meta, req)
+}
+
+// extractRequestTwoFACode 从单条 RPC 请求的命名参数中提取 2FA code。
+// 仅支持对象(map)形式的 params;按 2fa_code / two_factor_code / otp 顺序查找。
+func extractRequestTwoFACode(req *rpc.JsonRpcRequest) string {
+	for _, key := range []string{"2fa_code", "two_factor_code", "otp"} {
+		if v, ok := rpc.GetParamAs[string](req, key); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// headerOrQueryTwoFACode 从请求头 / query 兜底提取 2FA code(不读取 body,避免消费请求体)。
+func headerOrQueryTwoFACode(c *gin.Context) string {
+	if code := c.GetHeader("X-2FA-Code"); code != "" {
+		return code
+	}
+	if code := c.GetHeader("X-Two-Factor-Code"); code != "" {
+		return code
+	}
+	for _, key := range []string{"2fa_code", "two_factor_code", "otp"} {
+		if code := c.Query(key); code != "" {
+			return code
+		}
+	}
+	return ""
 }
 
 func serveWebSocket(c *gin.Context) {
-	_conn, err := api.UpgradeWebSocket(c)
+	conn, err := api.UpgradeSafeConn(c, api.EnableWebSocketCompression)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "Failed to upgrade to WebSocket." + err.Error()})
 		return
 	}
-	conn := connection.NewSafeConn(_conn)
 	defer conn.Close()
 
-	permissionGroup := detectPermissionGroup(c)
-	meta := buildContextMeta(c, permissionGroup)
+	meta := buildContextMeta(c)
 	for {
 		var req rpc.JsonRpcRequest
 		if err := conn.ReadJSON(&req); err != nil {
@@ -92,7 +114,7 @@ func serveWebSocket(c *gin.Context) {
 			continue
 		}
 		// 同步写：SafeConn 内部有锁，串行写避免响应乱序与并发竞态。
-		conn.WriteJSON(Dispatch(context.Background(), meta, &req))
+		conn.WriteJSON(dispatchWithSensitive(context.Background(), c, meta, &req))
 	}
 }
 
@@ -107,12 +129,11 @@ func servePost(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, jerr.Response())
 		return
 	}
-	permissionGroup := detectPermissionGroup(c)
-	meta := buildContextMeta(c, permissionGroup)
+	meta := buildContextMeta(c)
 
 	responses := make([]*rpc.JsonRpcResponse, 0, len(requests))
 	for _, rreq := range requests {
-		responses = append(responses, Dispatch(c.Request.Context(), meta, rreq))
+		responses = append(responses, dispatchWithSensitive(c.Request.Context(), c, meta, rreq))
 	}
 	// 单条直接对象，批量数组（符合 JSON-RPC 2.0）。
 	if len(responses) == 1 {
@@ -122,56 +143,45 @@ func servePost(c *gin.Context) {
 	}
 }
 
-// detectPermissionGroup 识别请求者权限分组 (guest/client/admin)。
-func detectPermissionGroup(c *gin.Context) string {
-	permissionGroup := rpc.RoleGuest
-	token := c.Query("Authorization")
-	if _, err := clients.GetClientUUIDByToken(token); err == nil {
-		permissionGroup = rpc.RoleClient
-	}
-	if sessionToken, _ := c.Cookie("session_token"); sessionToken != "" {
-		if _, err := accounts.GetUserBySession(sessionToken); err == nil {
-			permissionGroup = rpc.RoleAdmin
-		}
-	}
-	apiKey := c.GetHeader("Authorization")
-	if len(apiKey) <= len("Bearer ") {
-		return permissionGroup
-	}
-	cfg, _ := config.GetAs[string](config.ApiKeyKey, "")
-	if len(cfg) > 8 && apiKey == "Bearer "+cfg {
-		permissionGroup = rpc.RoleAdmin
-	}
-	return permissionGroup
-}
-
 // buildContextMeta 从 gin.Context 构建 *rpc.ContextMeta。
-func buildContextMeta(c *gin.Context, permissionGroup string) *rpc.ContextMeta {
-	meta := &rpc.ContextMeta{Permission: permissionGroup}
-	// 客户端 token：query Authorization 或 header Bearer。
-	token := c.Query("Authorization")
-	if token == "" {
-		hAuth := c.GetHeader("Authorization")
-		if strings.HasPrefix(hAuth, "Bearer ") {
-			token = strings.TrimPrefix(hAuth, "Bearer ")
-		}
+// 复用 IdentityMiddleware 已识别的 principal(api.GetPrincipal)；若未识别则兜底调用
+// api.IdentifyPrincipal。填充 principal、Permission(兼容)、User、各 UUID、token 等字段。
+func buildContextMeta(c *gin.Context) *rpc.ContextMeta {
+	// 优先读取中间件已识别的 principal；未识别时兜底自行识别(如 /api/rpc2 请求)。
+	p := api.GetPrincipal(c)
+	if p == nil {
+		p = api.IdentifyPrincipal(c)
 	}
-	if token != "" {
-		if uuid, err := clients.GetClientUUIDByToken(token); err == nil {
+
+	meta := &rpc.ContextMeta{
+		Principal:  p,
+		Permission: p.PrimaryRole(), // 兼容现有 handler 与 Dispatch
+		RemoteIP:   c.ClientIP(),
+		UserAgent:  c.GetHeader("User-Agent"),
+	}
+
+	// 根据主体类型填充具体字段。
+	switch p.Type {
+	case rpc.PrincipalUser:
+		meta.UserUUID = p.UserUUID
+		if session, err := c.Cookie("session_token"); err == nil && session != "" {
+			meta.SessionToken = session
+			if user, err := accounts.GetUserBySession(session); err == nil {
+				meta.User = &user
+			}
+		}
+	case rpc.PrincipalAgent:
+		meta.ClientUUID = p.ClientUUID
+		// 尝试提取 client token(用于某些 handler 需要原始 token 的场景)。
+		// 优先查询参数 ?Authorization=<token>，再尝试 Bearer header。
+		if token := c.Query("Authorization"); token != "" {
 			meta.ClientToken = token
-			meta.ClientUUID = uuid
+		} else if auth := c.GetHeader("Authorization"); auth != "" && len(auth) > len("Bearer ") {
+			meta.ClientToken = auth[len("Bearer "):]
 		}
 	}
-	// 用户身份：session cookie。
-	if sessionToken, _ := c.Cookie("session_token"); sessionToken != "" {
-		meta.SessionToken = sessionToken
-		if user, err := accounts.GetUserBySession(sessionToken); err == nil {
-			meta.User = &user
-			meta.UserUUID = user.UUID
-		}
-	}
-	meta.RemoteIP = c.ClientIP()
-	meta.UserAgent = c.GetHeader("User-Agent")
+
+	// 临时分享访问许可。
 	meta.TempShareValid = hasTempShareAccess(c)
 	return meta
 }

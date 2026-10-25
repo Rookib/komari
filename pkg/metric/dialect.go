@@ -21,9 +21,7 @@ type dialect interface {
 	jsonPlaceholder(n int) string
 	jsonType() string
 	autoIncrementPrimaryKey() string
-	nowExpr() string
 	insertDefinitionSQL(t tables) string
-	upsertPointSQL(t tables, rowCount int) string
 	// jsonExtractEquals renders a boolean predicate comparing the text value at
 	// key inside a JSON column to a bind placeholder. The key is interpolated
 	// into the SQL (callers must restrict it to a safe charset); the compared
@@ -37,10 +35,8 @@ type dialect interface {
 	//
 	// blobType 是 rollup t-digest sketch 的列类型。
 	blobType() string
-	// upsertRollupSQL builds a single-row upsert for one rollup bucket cell.
-	//
-	// upsertRollupSQL 为单个 rollup 桶单元构造单行 upsert。
-	upsertRollupSQL(t tables) string
+	renderSeriesDictionary(tables tables, indexName string, plan seriesDictionaryPlan) renderedSQL
+	renderRollupRead(tables tables, indexName string, plan rollupReadPlan) renderedSQL
 }
 
 // tables stores the physical table names used by a Store.
@@ -51,14 +47,21 @@ type tables struct {
 	//
 	// definitions 是指标定义表。
 	definitions string
-	// points is the raw points table.
-	//
-	// points 是原始采样点表。
+	// points and watermarks name legacy tables read only by the explicit
+	// structure rebuild. The normalized schema never creates either table.
 	points string
+	// series interns the name/entity/tag/tag-hash tuple.
+	series string
+	// resolutions interns rollup intervals in milliseconds.
+	resolutions string
+	// labels interns labels independently from series tags.
+	labels string
 	// rollups is the downsampled rollups table.
 	//
 	// rollups 是降采样 rollup 表。
-	rollups string
+	rollups    string
+	watermarks string
+	state      string
 }
 
 // newDialect returns the SQL dialect implementation for a backend.
@@ -100,17 +103,12 @@ func (sqliteDialect) jsonType() string { return "TEXT" }
 // autoIncrementPrimaryKey 返回 SQLite 自增主键定义。
 func (sqliteDialect) autoIncrementPrimaryKey() string { return "INTEGER PRIMARY KEY AUTOINCREMENT" }
 
-// nowExpr returns the SQL expression for the current time.
-//
-// nowExpr 返回 SQLite 当前时间表达式。
-func (sqliteDialect) nowExpr() string { return "CURRENT_TIMESTAMP" }
-
 // insertDefinitionSQL builds SQL for inserting or updating a metric definition.
 //
 // insertDefinitionSQL 构造 SQLite 指标定义 upsert SQL。
 func (sqliteDialect) insertDefinitionSQL(t tables) string {
 	return fmt.Sprintf(`INSERT INTO %s
-		(name, type, unit, description, retention_days, metadata, created_at, updated_at)
+		(name, type, unit, description, retention_days, metadata, created_at_milli, updated_at_milli)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			type = excluded.type,
@@ -118,18 +116,7 @@ func (sqliteDialect) insertDefinitionSQL(t tables) string {
 			description = excluded.description,
 			retention_days = excluded.retention_days,
 			metadata = excluded.metadata,
-			updated_at = excluded.updated_at`, t.definitions)
-}
-
-// upsertPointSQL builds SQL for inserting or updating metric points.
-//
-// upsertPointSQL 构造 SQLite 采样点批量 upsert SQL。
-func (sqliteDialect) upsertPointSQL(t tables, rowCount int) string {
-	return buildInsertPointsSQL(t.points, sqliteDialect{}, rowCount, `ON CONFLICT(metric_name, entity_id, tags_hash, ts_nano) DO UPDATE SET
-		value = excluded.value,
-		tags = excluded.tags,
-		labels = excluded.labels,
-		created_at = excluded.created_at`)
+			updated_at_milli = excluded.updated_at_milli`, t.definitions)
 }
 
 // mysqlDialect implements SQL rendering for MySQL.
@@ -157,17 +144,12 @@ func (mysqlDialect) jsonType() string { return "JSON" }
 // autoIncrementPrimaryKey 返回 MySQL 自增主键定义。
 func (mysqlDialect) autoIncrementPrimaryKey() string { return "BIGINT AUTO_INCREMENT PRIMARY KEY" }
 
-// nowExpr returns the SQL expression for the current time.
-//
-// nowExpr 返回 MySQL 当前时间表达式。
-func (mysqlDialect) nowExpr() string { return "CURRENT_TIMESTAMP" }
-
 // insertDefinitionSQL builds SQL for inserting or updating a metric definition.
 //
 // insertDefinitionSQL 构造 MySQL 指标定义 upsert SQL。
 func (mysqlDialect) insertDefinitionSQL(t tables) string {
 	return fmt.Sprintf(`INSERT INTO %s
-		(name, type, unit, description, retention_days, metadata, created_at, updated_at)
+		(name, type, unit, description, retention_days, metadata, created_at_milli, updated_at_milli)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 			type = VALUES(type),
@@ -175,18 +157,7 @@ func (mysqlDialect) insertDefinitionSQL(t tables) string {
 			description = VALUES(description),
 			retention_days = VALUES(retention_days),
 			metadata = VALUES(metadata),
-			updated_at = VALUES(updated_at)`, t.definitions)
-}
-
-// upsertPointSQL builds SQL for inserting or updating metric points.
-//
-// upsertPointSQL 构造 MySQL 采样点批量 upsert SQL。
-func (mysqlDialect) upsertPointSQL(t tables, rowCount int) string {
-	return buildInsertPointsSQL(t.points, mysqlDialect{}, rowCount, `ON DUPLICATE KEY UPDATE
-		value = VALUES(value),
-		tags = VALUES(tags),
-		labels = VALUES(labels),
-		created_at = VALUES(created_at)`)
+			updated_at_milli = VALUES(updated_at_milli)`, t.definitions)
 }
 
 // postgresDialect implements SQL rendering for PostgreSQL.
@@ -214,17 +185,12 @@ func (postgresDialect) jsonType() string { return "JSONB" }
 // autoIncrementPrimaryKey 返回 PostgreSQL 自增主键定义。
 func (postgresDialect) autoIncrementPrimaryKey() string { return "BIGSERIAL PRIMARY KEY" }
 
-// nowExpr returns the SQL expression for the current time.
-//
-// nowExpr 返回 PostgreSQL 当前时间表达式。
-func (postgresDialect) nowExpr() string { return "CURRENT_TIMESTAMP" }
-
 // insertDefinitionSQL builds SQL for inserting or updating a metric definition.
 //
 // insertDefinitionSQL 构造 PostgreSQL 指标定义 upsert SQL。
 func (postgresDialect) insertDefinitionSQL(t tables) string {
 	return fmt.Sprintf(`INSERT INTO %s
-		(name, type, unit, description, retention_days, metadata, created_at, updated_at)
+		(name, type, unit, description, retention_days, metadata, created_at_milli, updated_at_milli)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
 		ON CONFLICT(name) DO UPDATE SET
 			type = EXCLUDED.type,
@@ -232,52 +198,7 @@ func (postgresDialect) insertDefinitionSQL(t tables) string {
 			description = EXCLUDED.description,
 			retention_days = EXCLUDED.retention_days,
 			metadata = EXCLUDED.metadata,
-			updated_at = EXCLUDED.updated_at`, t.definitions)
-}
-
-// upsertPointSQL builds SQL for inserting or updating metric points.
-//
-// upsertPointSQL 构造 PostgreSQL 采样点批量 upsert SQL。
-func (postgresDialect) upsertPointSQL(t tables, rowCount int) string {
-	return buildInsertPointsSQL(t.points, postgresDialect{}, rowCount, `ON CONFLICT(metric_name, entity_id, tags_hash, ts_nano) DO UPDATE SET
-		value = EXCLUDED.value,
-		tags = EXCLUDED.tags,
-		labels = EXCLUDED.labels,
-		created_at = EXCLUDED.created_at`)
-}
-
-// buildInsertPointsSQL builds a multi-row insert statement for metric points.
-//
-// buildInsertPointsSQL 构造多行采样点 INSERT/UPSERT SQL。
-func buildInsertPointsSQL(table string, d dialect, rowCount int, suffix string) string {
-	var b strings.Builder
-	b.WriteString("INSERT INTO ")
-	b.WriteString(table)
-	b.WriteString(" (metric_name, entity_id, tags_hash, ts_nano, value, tags, labels, created_at) VALUES ")
-	arg := 1
-	rows := make([]string, rowCount)
-	for i := 0; i < rowCount; i++ {
-		parts := make([]string, 8)
-		for j := range parts {
-			// Columns are (metric_name, entity_id, tags_hash, ts_nano, value, tags,
-			// labels, created_at); positions 5 and 6 (0-indexed) are JSON values.
-			// tags_hash makes the tag set part of a point's identity, so points
-			// that share entity+timestamp but differ in tags no longer collide.
-			if j == 5 || j == 6 {
-				parts[j] = d.jsonPlaceholder(arg)
-			} else {
-				parts[j] = d.placeholder(arg)
-			}
-			arg++
-		}
-		rows[i] = "(" + strings.Join(parts, ", ") + ")"
-	}
-	b.WriteString(strings.Join(rows, ", "))
-	if suffix != "" {
-		b.WriteByte(' ')
-		b.WriteString(suffix)
-	}
-	return b.String()
+			updated_at_milli = EXCLUDED.updated_at_milli`, t.definitions)
 }
 
 // tableName combines a table prefix and logical table name.
@@ -294,7 +215,7 @@ func tableName(prefix, name string) string {
 // insertDefinitionOnlySQL 构造普通 INSERT（不带 upsert），供
 // CreateMetric 保持“只创建”语义；重复名称会暴露为唯一约束错误。
 func insertDefinitionOnlySQL(d dialect, t tables) string {
-	cols := "(name, type, unit, description, retention_days, metadata, created_at, updated_at)"
+	cols := "(name, type, unit, description, retention_days, metadata, created_at_milli, updated_at_milli)"
 	ph := []string{
 		d.placeholder(1),
 		d.placeholder(2),
@@ -367,66 +288,4 @@ func (postgresDialect) jsonExtractEquals(column, key, placeholder string) string
 	// so a dot or hyphen in the key is harmless; only single quotes need SQL
 	// escaping.
 	return fmt.Sprintf("%s->>'%s' = %s", column, sqlSingleQuote(key), placeholder)
-}
-
-// sqlAggValueExpr returns the SQL value expression that computes agg over the
-// "value" column for the given driver, and whether that aggregation can be
-// pushed down to this backend. Aggregations that need the ordered raw series
-// (first/last/rate) are never pushed down here. Percentiles and population
-// standard deviation are pushed down only where the backend has a portable,
-// semantics-matching function:
-//
-//   - STDDEV_POP: MySQL and PostgreSQL (matches the in-memory population stddev,
-//     which divides by N). SQLite has no built-in, so it falls back to memory.
-//   - percentile_cont(p) WITHIN GROUP (ORDER BY value): PostgreSQL only. This
-//     matches the in-memory linear-interpolation percentile for ANY p (p50,
-//     p95, p99, p99.9, ...). MySQL lacks a portable continuous-percentile
-//     function and SQLite has none, so both fall back to memory.
-//
-// The simple reductions (avg/min/max/sum/count) are portable everywhere.
-//
-// sqlAggValueExpr 返回给定驱动上对 "value" 列计算 agg 的 SQL 值表达式，
-// 以及该聚合是否能下推到该后端。需要有序原始序列的聚合（first/last/rate）
-// 永远不会在这里下推。百分位和总体标准差只会在后端提供可移植且语义匹配的函数时
-// 下推：
-//
-//   - STDDEV_POP：MySQL 和 PostgreSQL 支持（匹配内存中的总体标准差，
-//     即除以 N）。SQLite 没有内置函数，因此回退到内存计算。
-//   - percentile_cont(p) WITHIN GROUP (ORDER BY value)：仅 PostgreSQL 支持。
-//     它匹配内存中任意 p（p50、p95、p99、p99.9 等）的线性插值百分位。
-//     MySQL 没有可移植的连续百分位函数，SQLite 也没有，因此两者都回退到内存计算。
-//
-// 简单归约（avg/min/max/sum/count）在所有后端都可移植。
-func sqlAggValueExpr(driver Driver, agg Aggregation) (string, bool) {
-	switch agg {
-	case AggAvg:
-		return "AVG(value)", true
-	case AggMin:
-		return "MIN(value)", true
-	case AggMax:
-		return "MAX(value)", true
-	case AggSum:
-		return "SUM(value)", true
-	case AggCount:
-		return "COUNT(*)", true
-	case AggStdDev:
-		switch driver {
-		case DriverMySQL, DriverPostgreSQL:
-			return "STDDEV_POP(value)", true
-		default:
-			return "", false
-		}
-	default:
-		// Any percentile (fixed p50/p95/p99 and arbitrary pXX / pXX.X all land
-		// here). PostgreSQL has a portable continuous percentile that matches the
-		// in-memory linear-interpolation percentile; other backends fall back to
-		// the in-memory path.
-		if frac, ok := percentileFractionString(agg); ok {
-			if driver == DriverPostgreSQL {
-				return fmt.Sprintf("percentile_cont(%s) WITHIN GROUP (ORDER BY value)", frac), true
-			}
-			return "", false
-		}
-		return "", false
-	}
 }

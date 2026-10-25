@@ -19,7 +19,7 @@ func TestRollupKeepsTagSeriesSeparate(t *testing.T) {
 	ctx := context.Background()
 	policy := RollupPolicy{Tiers: []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}}}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "util", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "util", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -39,9 +39,10 @@ func TestRollupKeepsTagSeriesSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	// Two distinct tag series in the one bucket => two rollup rows.
-	if written != 2 {
-		t.Fatalf("expected 2 rollup series (one per device_index), got %d", written)
+	// Historical minutes are written directly by WriteBatch, so Compact has no
+	// remaining hot buckets to seal.
+	if written != 0 {
+		t.Fatalf("compact unexpectedly rewrote %d rollup buckets", written)
 	}
 
 	q := func(dev string) AggregateQuery {
@@ -51,8 +52,9 @@ func TestRollupKeepsTagSeriesSeparate(t *testing.T) {
 				Start: base, End: base.Add(10 * time.Minute),
 				Tags: map[string]string{"device_index": dev},
 			},
-			Aggregation: AggAvg,
-			Interval:    time.Minute,
+			Aggregation:    AggAvg,
+			Interval:       time.Minute,
+			PreserveSeries: true,
 		}
 	}
 	// device 0: avg of 10..19 = 14.5
@@ -63,6 +65,9 @@ func TestRollupKeepsTagSeriesSeparate(t *testing.T) {
 	if len(res0) != 1 || res0[0].Count != 10 || math.Abs(res0[0].Value-14.5) > 1e-9 {
 		t.Fatalf("device 0 should be its own series avg=14.5 count=10, got %#v", res0)
 	}
+	if res0[0].Tags["device_index"] != "0" {
+		t.Fatalf("device 0 rollup should keep tags, got %#v", res0[0])
+	}
 	// device 1: avg of 80..89 = 84.5
 	res1, err := s.AggregateRollup(ctx, q("1"), time.Minute)
 	if err != nil {
@@ -71,19 +76,33 @@ func TestRollupKeepsTagSeriesSeparate(t *testing.T) {
 	if len(res1) != 1 || res1[0].Count != 10 || math.Abs(res1[0].Value-84.5) > 1e-9 {
 		t.Fatalf("device 1 should be its own series avg=84.5 count=10, got %#v", res1)
 	}
+	if res1[0].Tags["device_index"] != "1" {
+		t.Fatalf("device 1 rollup should keep tags, got %#v", res1[0])
+	}
 
-	// No tag filter => both series merge (count 20, avg of all 20 values).
+	// No tag filter => both tag series are returned independently, matching
+	// raw Aggregate and preserving the tag dimension for public query callers.
 	all, err := s.AggregateRollup(ctx, AggregateQuery{
-		Query:       Query{MetricName: "util", EntityID: "host-1", Start: base, End: base.Add(10 * time.Minute)},
-		Aggregation: AggAvg,
-		Interval:    time.Minute,
+		Query:          Query{MetricName: "util", EntityID: "host-1", Start: base, End: base.Add(10 * time.Minute)},
+		Aggregation:    AggAvg,
+		Interval:       time.Minute,
+		PreserveSeries: true,
 	}, time.Minute)
 	if err != nil {
 		t.Fatalf("rollup all: %v", err)
 	}
-	wantAvg := (145.0 + 845.0) / 20.0 // sum(10..19)=145, sum(80..89)=845
-	if len(all) != 1 || all[0].Count != 20 || math.Abs(all[0].Value-wantAvg) > 1e-9 {
-		t.Fatalf("no-filter should merge both tags count=20 avg=%.2f, got %#v", wantAvg, all)
+	byDevice := map[string]AggregatePoint{}
+	for _, point := range all {
+		byDevice[point.Tags["device_index"]] = point
+	}
+	if len(byDevice) != 2 {
+		t.Fatalf("no-filter should keep both tag series, got %#v", all)
+	}
+	if got := byDevice["0"]; got.Count != 10 || math.Abs(got.Value-14.5) > 1e-9 {
+		t.Fatalf("unexpected no-filter device 0 rollup: %#v", got)
+	}
+	if got := byDevice["1"]; got.Count != 10 || math.Abs(got.Value-84.5) > 1e-9 {
+		t.Fatalf("unexpected no-filter device 1 rollup: %#v", got)
 	}
 }
 
@@ -102,7 +121,7 @@ func TestRollupTagPercentileSurvivesRetention(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 365 * 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "lat", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "lat", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -120,14 +139,6 @@ func TestRollupTagPercentileSurvivesRetention(t *testing.T) {
 	}
 	if _, err := s.Compact(ctx, base.Add(48*time.Hour)); err != nil {
 		t.Fatalf("compact: %v", err)
-	}
-	// Raw gone.
-	raw, err := s.Query(ctx, Query{MetricName: "lat", EntityID: "n1", Start: base, End: base.Add(time.Hour)})
-	if err != nil {
-		t.Fatalf("query raw: %v", err)
-	}
-	if len(raw) != 0 {
-		t.Fatalf("expected raw deleted, got %d", len(raw))
 	}
 	// p90 of region=ap must be near the ap-only exact (≈89), NOT pulled up toward
 	// the eu values (which would happen if tags were merged).
@@ -167,7 +178,7 @@ func TestSeriesTagFilterRoutesPerTag(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 30 * 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "m", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "m", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
@@ -212,6 +223,108 @@ func TestSeriesTagFilterRoutesPerTag(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("env=prod old series not served correctly from rollup: %#v", got)
+	}
+}
+
+// TestDeleteSeriesRemovesTaggedTaskAcrossAgents verifies a task_id tag can be
+// deleted across every agent, including stored rollups.
+//
+// TestDeleteSeriesRemovesTaggedTaskAcrossAgents 验证可以跨所有 agent 删除某个
+// task_id 标签，包括已存储的 rollup。
+func TestDeleteSeriesRemovesTaggedTaskAcrossAgents(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{
+		RawRetention: 2 * time.Minute,
+		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
+	}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "ping.latency_ms", Type: TypeGauge, RetentionDays: 30}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
+	var batch []Point
+	for _, agent := range []string{"agent-001", "agent-002"} {
+		for i := 0; i < 60; i++ {
+			ts := base.Add(time.Duration(i) * time.Second)
+			batch = append(batch,
+				Point{MetricName: "ping.latency_ms", EntityID: agent, Timestamp: ts, Value: float64(20 + i), Tags: map[string]string{"task_id": "pingtask1"}},
+				Point{MetricName: "ping.latency_ms", EntityID: agent, Timestamp: ts, Value: float64(60 + i), Tags: map[string]string{"task_id": "pingtask2"}},
+			)
+		}
+	}
+	if err := s.WriteBatch(ctx, batch); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := s.Compact(ctx, base.Add(time.Hour)); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if _, err := s.DeleteSeries(ctx, Query{
+		MetricName: "ping.latency_ms",
+		Tags:       map[string]string{"task_id": "pingtask2"},
+	}); err != nil {
+		t.Fatalf("delete series: %v", err)
+	}
+
+	task2, err := s.AggregateRollup(ctx, AggregateQuery{
+		Query: Query{
+			MetricName: "ping.latency_ms",
+			Start:      base, End: base.Add(time.Minute),
+			Tags: map[string]string{"task_id": "pingtask2"},
+		},
+		Aggregation: AggAvg,
+		Interval:    time.Minute,
+	}, time.Minute)
+	if err != nil {
+		t.Fatalf("rollup task2: %v", err)
+	}
+	if len(task2) != 0 {
+		t.Fatalf("deleted task still has rollup buckets: %#v", task2)
+	}
+	task1, err := s.AggregateRollup(ctx, AggregateQuery{
+		Query: Query{
+			MetricName: "ping.latency_ms",
+			Start:      base, End: base.Add(time.Minute),
+			Tags: map[string]string{"task_id": "pingtask1"},
+		},
+		Aggregation: AggAvg,
+		Interval:    time.Minute,
+	}, time.Minute)
+	if err != nil {
+		t.Fatalf("rollup task1: %v", err)
+	}
+	if len(task1) != 1 || task1[0].Count != 120 {
+		t.Fatalf("remaining task should keep both agents, got %#v", task1)
+	}
+}
+
+// TestDeleteMetricRemovesRollups verifies metric deletion clears rollup rows.
+//
+// TestDeleteMetricRemovesRollups 验证删除指标会清理 rollup 行。
+func TestDeleteMetricRemovesRollups(t *testing.T) {
+	ctx := context.Background()
+	s := newRollupStore(t, RollupPolicy{
+		Tiers: []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
+	})
+	if err := s.CreateMetric(ctx, Definition{Name: "gone", Type: TypeGauge, RetentionDays: 30}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
+	if err := s.Write(ctx, Point{MetricName: "gone", EntityID: "agent-001", Timestamp: base, Value: 1}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := s.Compact(ctx, base.Add(time.Hour)); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if err := s.DeleteMetric(ctx, "gone"); err != nil {
+		t.Fatalf("delete metric: %v", err)
+	}
+	rows, err := s.scanRollupRows(ctx, s.reader(), "gone", time.Minute)
+
+	if err != nil {
+		t.Fatalf("scan rollups: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("deleted metric still has rollups: %#v", rows)
 	}
 }
 

@@ -1,0 +1,30 @@
+{
+  "panel_base_url": "https://suckdry.com",
+  "browser_channel": "chrome",
+  "accounts": [
+    {
+      "name": "dmit-malibu",
+      "client_uuid": "填写 Komari 节点 UUID",
+      "collector_key": "填写随机长密钥，需和 panel official_traffic_sources 中一致",
+      "source_name": "DMIT 官方缓存 - MALIBU",
+      "profile_dir": "profiles/dmit-malibu",
+      "login_url": "https://www.dmit.io/clientarea.php",
+      "target_url": "https://www.dmit.io/clientarea.php?action=services",
+      "used_selector": "",
+      "limit_selector": "",
+      "traffic_regex": "([0-9.]+)\\s*(GB|TB)\\s*/\\s*([0-9.]+)\\s*(GB|TB)"
+    },
+    {
+      "name": "dmit-corona",
+      "client_uuid": "填写 Komari 节点 UUID",
+      "collector_key": "填写另一个随机长密钥",
+      "source_name": "DMIT 官方缓存 - EB.CORONA",
+      "profile_dir": "profiles/dmit-corona",
+      "login_url": "https://www.dmit.io/clientarea.php",
+      "target_url": "https://www.dmit.io/clientarea.php?action=services",
+      "used_selector": "",
+      "limit_selector": "",
+      "traffic_regex": "([0-9.]+)\\s*(GB|TB)\\s*/\\s*([0-9.]+)\\s*(GB|TB)"
+    }
+  ]
+}

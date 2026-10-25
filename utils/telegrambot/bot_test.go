@@ -3,6 +3,7 @@ package telegrambot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -82,7 +83,7 @@ func TestSetCommandsAndGetUpdates(t *testing.T) {
 
 	b := &bot{baseURL: server.URL + "/bot-token", chatID: 42, client: server.Client()}
 	require.NoError(t, b.configureMenu(context.Background()))
-	assert.Equal(t, 12, commandCount)
+	assert.Equal(t, 15, commandCount)
 	assert.True(t, menuButtonSet)
 
 	updates, err := b.getUpdates(context.Background(), 10)
@@ -120,14 +121,132 @@ func TestHumanBytes(t *testing.T) {
 	assert.Equal(t, "1.50 GB", humanBytes(3*1024*1024*1024/2))
 }
 
+func TestResetStatusForReportedClients(t *testing.T) {
+	b := &bot{location: time.UTC}
+
+	configured := b.resetStatusForClient(models.Client{TrafficResetReported: true, TrafficResetDay: 31}, time.Now())
+	assert.Equal(t, resetStatusConfigured, configured.Kind)
+	assert.Equal(t, "每月 31 日（短月顺延）", configured.Text)
+
+	disabled := b.resetStatusForClient(models.Client{TrafficResetReported: true, TrafficResetDay: 0}, time.Now())
+	assert.Equal(t, resetStatusDisabled, disabled.Kind)
+	assert.Equal(t, "未启用", disabled.Text)
+}
+
+func TestFormatResetListLine(t *testing.T) {
+	client := models.Client{Name: "VPS <01>"}
+
+	assert.Equal(t, "✅ <b>VPS &lt;01&gt;</b> — 每月 11 日", formatResetListLine(client, resetStatus{Kind: resetStatusConfigured, Text: "每月 11 日"}))
+	assert.Equal(t, "➖ <b>VPS &lt;01&gt;</b> — 未启用", formatResetListLine(client, resetStatus{Kind: resetStatusDisabled, Text: "未启用"}))
+	assert.Equal(t, "🧭 <b>VPS &lt;01&gt;</b> — 推测每月 1 日", formatResetListLine(client, resetStatus{Kind: resetStatusInferred, Text: "推测每月 1 日"}))
+	assert.Equal(t, "❔ <b>VPS &lt;01&gt;</b> — 暂未检测到", formatResetListLine(client, resetStatus{Kind: resetStatusUnknown, Text: "暂未检测到"}))
+}
+
+func TestChunkTelegramMessage(t *testing.T) {
+	lines := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		lines = append(lines, strings.Repeat("机器", 20))
+	}
+
+	chunks := chunkTelegramMessage("<b>header</b>\n\n", lines)
+
+	require.Greater(t, len(chunks), 1)
+	for _, chunk := range chunks {
+		assert.LessOrEqual(t, len(chunk), 3800)
+	}
+}
+
+func TestNodesPagePanelPaginates(t *testing.T) {
+	list := make([]models.Client, 0, nodePageSize+1)
+	for i := 0; i < nodePageSize+1; i++ {
+		list = append(list, models.Client{UUID: fmt.Sprintf("uuid-%02d", i), Name: fmt.Sprintf("Node %02d", i)})
+	}
+
+	text, keyboard := nodesPagePanel(list, 0)
+
+	assert.Contains(t, text, "第 1/2 页")
+	require.NotNil(t, keyboard)
+	assert.Contains(t, keyboard.InlineKeyboard[len(keyboard.InlineKeyboard)-2][0].Text, "1/2")
+	assert.Equal(t, "下一页 ➡️", keyboard.InlineKeyboard[len(keyboard.InlineKeyboard)-2][1].Text)
+}
+
+func TestMainMenuKeyboard(t *testing.T) {
+	keyboard := mainMenuKeyboard()
+
+	require.NotNil(t, keyboard)
+	assert.Equal(t, "menu:traffic", keyboard.InlineKeyboard[0][0].CallbackData)
+	assert.Equal(t, "nodes:0", keyboard.InlineKeyboard[0][1].CallbackData)
+	assert.Equal(t, "report:", keyboard.InlineKeyboard[2][0].CallbackData)
+}
+
+func TestRenderMainMenuText(t *testing.T) {
+	text := renderMainMenuText(menuStats{
+		Total:           12,
+		Online:          10,
+		Limited:         7,
+		ResetConfigured: 5,
+		Timezone:        "Asia/Shanghai",
+	})
+
+	assert.Contains(t, text, "Komari 流量控制台")
+	assert.Contains(t, text, "在线：<b>10 / 12</b>")
+	assert.Contains(t, text, "限额：<b>7</b>")
+	assert.Contains(t, text, "重置日：<b>5</b>")
+}
+
+func TestTruncateButtonText(t *testing.T) {
+	assert.Equal(t, "短名称", truncateButtonText("短名称"))
+	assert.True(t, strings.HasSuffix(truncateButtonText(strings.Repeat("长", 40)), "…"))
+}
+
 func TestCompactTrafficCards(t *testing.T) {
 	client := models.Client{Name: "VPS <01>"}
 	totals := notifier.TrafficTotals{Up: 12 * 1024 * 1024, Down: 608 * 1024 * 1024}
 
 	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n🔼 上传: 12.00 MB\n🔽 下载: 608.00 MB\n📊 今日: <b>620.00 MB</b>", formatTrafficCard(client, totals, "今日"))
 	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n⚠️ 流量统计失败", formatTrafficErrorCard(client))
-	assert.Equal(t, "🖥️ 机器: <b>全部机器（2 台）</b>\n🔼 上传: 1.00 KB\n🔽 下载: 2.00 KB\n📊 总计: <b>3.00 KB</b>", formatAllTrafficCard(2, 1024, 2048))
-	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n📈 已用: 600.00 MB\n📦 剩余: <b>400.00 MB</b>\n📊 总量: 1000.00 MB", formatRemainingCard(client, 600*1024*1024, 400*1024*1024, 1000*1024*1024, false))
-	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n📈 已用: 600.00 MB\n📦 剩余: <b>∞ 无限</b>\n📊 总量: ∞ 无限", formatRemainingCard(client, 600*1024*1024, 0, 0, true))
-	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n🔄 重置: 每月 1 日", formatResetCard(client, "每月 1 日"))
+	assert.Equal(t, "🖥️ 机器: <b>全部机器（2 台）</b>\n━━━━━━━━━━━━━━\n🔼 上传: 1.00 KB\n🔽 下载: 2.00 KB\n📊 总计: <b>3.00 KB</b>", formatAllTrafficCard(2, 1024, 2048))
+	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n━━━━━━━━━━━━━━\n📈 已用: 600.00 MB / 1000.00 MB\n📦 剩余: <b>400.00 MB</b>\n🎯 状态: 🟢 安全　60.0%\n▰▰▰▰▰▰▱▱▱▱", formatRemainingCard(client, 600*1024*1024, 400*1024*1024, 1000*1024*1024, false))
+	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n━━━━━━━━━━━━━━\n📈 已用: 600.00 MB\n📦 剩余: <b>∞ 无限</b>\n📊 总量: ∞ 无限\n🎯 状态: ⚪ 未设置流量上限", formatRemainingCard(client, 600*1024*1024, 0, 0, true))
+	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n━━━━━━━━━━━━━━\n🔄 重置: 每月 1 日", formatResetCard(client, "每月 1 日"))
+	assert.Equal(t, "🖥️ 机器: <b>VPS &lt;01&gt;</b>\n🔼 上传: 12.00 MB\n🔽 下载: 608.00 MB\n📊 周期: <b>620.00 MB</b>\n📡 官方源: 暂不可用，已回退探针数据", formatTrafficCardWithNote(client, totals, "周期", "📡 官方源: 暂不可用，已回退探针数据"))
+	assert.Equal(t, "▰▰▰▰▰▰▱▱▱▱", progressBar(60))
+	icon, text := trafficUsageStatus(92)
+	assert.Equal(t, "🔴", icon)
+	assert.Equal(t, "危险", text)
+}
+
+func TestCapTrafficTotals(t *testing.T) {
+	capped := capTrafficTotals(
+		notifier.TrafficTotals{Up: 275 * 1024, Down: 329 * 1024},
+		notifier.TrafficTotals{Up: 9 * 1024, Down: 12 * 1024},
+	)
+
+	assert.Equal(t, notifier.TrafficTotals{Up: 9 * 1024, Down: 12 * 1024}, capped)
+
+	unchanged := capTrafficTotals(
+		notifier.TrafficTotals{Up: 5 * 1024, Down: 6 * 1024},
+		notifier.TrafficTotals{Up: 9 * 1024, Down: 12 * 1024},
+	)
+
+	assert.Equal(t, notifier.TrafficTotals{Up: 5 * 1024, Down: 6 * 1024}, unchanged)
+}
+
+func TestNewBotRejectsInsecureAndCredentialedEndpoints(t *testing.T) {
+	for _, endpoint := range []string{"http://example.com/bot", "https://user:secret@example.com/bot", "https://example.com/bot?secret=1", "https://example.com/bot#token"} {
+		_, err := newBot(telegramprovider.Addition{BotToken: "private-token", ChatID: "42", Endpoint: endpoint})
+		if err == nil {
+			t.Errorf("insecure endpoint accepted: %s", endpoint)
+		}
+		if err != nil && strings.Contains(err.Error(), "secret") {
+			t.Error("credential leaked through error")
+		}
+	}
+}
+
+func TestBotTransportErrorDoesNotExposeToken(t *testing.T) {
+	b := &bot{baseURL: "http://127.0.0.1:1/bot-private-token", client: &http.Client{Timeout: time.Second}}
+	err := b.call(context.Background(), "getUpdates", url.Values{}, nil)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "private-token")
 }

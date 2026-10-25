@@ -31,3 +31,19 @@ func TestAllowSSHLoginEventRateLimit(t *testing.T) {
 	assert.False(t, allowSSHLoginEvent(clientUUID, now.Add(time.Second)))
 	assert.True(t, allowSSHLoginEvent(clientUUID, now.Add(2*time.Minute)))
 }
+
+func TestFormatSSHLoginMessageUsesChineseCardFields(t *testing.T) {
+	occurredAt := time.Date(2026, 6, 23, 14, 52, 26, 0, time.UTC)
+	message := formatSSHLoginMessage(v2.SSHLoginParams{
+		User:       "root",
+		RemoteIP:   "216.167.123.206",
+		RemotePort: 22,
+		AuthMethod: "publickey",
+	}, occurredAt)
+
+	assert.Contains(t, message, "👤 登录账户：root")
+	assert.Contains(t, message, "🌐 来源地址：216.167.123.206")
+	assert.Contains(t, message, "💻 登录终端：ssh")
+	assert.Contains(t, message, "🔑 认证方式：密钥")
+	assert.Contains(t, message, "🕒 登录时间：2026-06-23 22:52:26 北京时间")
+}

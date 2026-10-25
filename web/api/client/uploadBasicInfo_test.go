@@ -8,7 +8,7 @@ import (
 	"github.com/komari-monitor/komari/cmd/flags"
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	v2 "github.com/komari-monitor/komari/protocol/v2"
 	"github.com/komari-monitor/komari/utils/geoip"
 )
@@ -50,7 +50,7 @@ func TestV2BasicInfoFillsRegionFromGeoIP(t *testing.T) {
 	})
 
 	clientUUID := "client-v2-geoip"
-	now := models.FromTime(time.Now())
+	now := time.Now().UTC()
 	if err := db.Create(&models.Client{
 		UUID:      clientUUID,
 		Token:     "token-v2-geoip",
@@ -87,5 +87,34 @@ func TestV2BasicInfoFillsRegionFromGeoIP(t *testing.T) {
 	}
 	if !got.TrafficResetReported || got.TrafficResetDay != 15 || got.TrafficResetTimezone != "Asia/Shanghai" {
 		t.Fatalf("expected exact traffic reset config to be saved, got reported=%v day=%d timezone=%q", got.TrafficResetReported, got.TrafficResetDay, got.TrafficResetTimezone)
+	}
+}
+
+func TestAgentBasicInfoCannotOverwriteAdministrativeFields(t *testing.T) {
+	info := map[string]interface{}{"uuid": "other-node", "token": "replacement", "name": "renamed", "hidden": false,
+		"price": 0, "traffic_limit": 0, "vnstat_baseline_up": 0, "cpu_name": "CPU", "traffic_reset_day": 15, "vnstat_total_up": 123}
+	got := filterAgentBasicInfo(info)
+	if len(got) != 3 || got["cpu_name"] != "CPU" || got["traffic_reset_day"] != 15 || got["vnstat_total_up"] != 123 {
+		t.Fatalf("unexpected allowed telemetry fields: %v", got)
+	}
+}
+
+func TestMalformedAgentIntegerMetadataDoesNotChangeStoredNode(t *testing.T) {
+	db := dbcore.GetDBInstance()
+	uuid := "client-basic-info-fraction"
+	if err := db.Create(&models.Client{UUID: uuid, Token: "fraction-token", CpuCores: 4, TrafficResetDay: 15}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]interface{}{"cpu_cores": 0.5, "traffic_reset_day": 15.5, "vnstat_total_up": float64(9223372036854775808.0)} {
+		if err := saveClientBasicInfo(map[string]interface{}{key: value}, uuid, ""); err == nil {
+			t.Fatalf("accepted malformed %s", key)
+		}
+	}
+	var got models.Client
+	if err := db.First(&got, "uuid = ?", uuid).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.CpuCores != 4 || got.TrafficResetDay != 15 {
+		t.Fatal("malformed metadata modified node")
 	}
 }

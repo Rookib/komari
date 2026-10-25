@@ -416,11 +416,17 @@ class Cutover:
         self.save(backup_ready=True)
         self.mark('copying_candidate')
         self.copy_tree(backup, candidate)
+        # SQLite uses file-backed sort/index/VACUUM scratch space. A 256 MiB
+        # tmpfs cannot safely represent a multi-gigabyte migration rehearsal.
+        # Keep scratch on the already budgeted disk, isolated from host /var/tmp.
+        migration_tmp = self.run / 'migration-tmp'
+        migration_tmp.mkdir(mode=0o700)
         self.mark('migrating_offline')
         self.cmd(['docker', 'create', '--name', self.state['migration_name'],
                   '--label', 'komari.safe-upgrade.run=' + self.run.name,
                   '--network', 'none', '--restart', 'no', '--read-only', '--cap-drop', 'ALL',
-                  '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,size=256m',
+                  '--security-opt', 'no-new-privileges', '--env', 'SQLITE_TMPDIR=/tmp',
+                  '--mount', 'type=bind,src=' + str(migration_tmp) + ',dst=/tmp',
                   '--mount', 'type=bind,src=' + str(candidate) + ',dst=/app/data',
                   '--mount', 'type=bind,src=' + str(backup) + ',dst=/backup,readonly',
                   '--mount', 'type=bind,src=' + str(self.args.migrator) + ',dst=/migrate,readonly',
@@ -431,6 +437,7 @@ class Cutover:
         migrated = self.inspect(self.state['migration_name'])
         require(not migrated['State']['Running'] and migrated['State'].get('ExitCode') == 0,
                 'offline_migration_failed')
+        self.cleanup_migration_tmp()
         self.mark('auditing_original_and_candidate')
         # Source is the stopped original, never the independent rollback backup.
         # SQLite read-only WAL access may update a transient SHM file on the source.
@@ -581,6 +588,25 @@ class Cutover:
         fsync_dir(self.run)
         self.recovery_record(data_restored=True)
 
+    def cleanup_migration_tmp(self):
+        """Delete only this run's private scratch, after every writer is stopped."""
+        scratch = self.run / 'migration-tmp'
+        if not scratch.exists() and not scratch.is_symlink():
+            return
+        real_path(scratch, directory=True)
+        require(scratch.parent == self.run and scratch.stat().st_uid == os.geteuid() and
+                stat.S_IMODE(scratch.stat().st_mode) == 0o700, 'untrusted_migration_scratch_directory')
+        require(self.calibrator_lock is not None, 'scratch_cleanup_requires_calibrator_lock')
+        require(all(unit['ActiveState'] in ('inactive', 'failed') for unit in self.unit_states().values()),
+                'scratch_cleanup_requires_stopped_units')
+        for name in (self.state['old_id'], self.state['migration_name'], 'komari'):
+            item = self.inspect(name, missing_ok=name != self.state['old_id'])
+            require(not item or not item['State']['Running'], 'scratch_cleanup_requires_stopped_containers')
+        # rmtree does not follow interior symlinks; canonical top-level path and
+        # its exact name are checked above. Backups/failed-data are never deleted.
+        shutil.rmtree(scratch)
+        fsync_dir(self.run)
+
     def rollback(self):
         require(self.state.get('stop_intent'), 'run_has_not_changed_production')
         self.recovery_record(phase='rolling_back')
@@ -605,6 +631,11 @@ class Cutover:
         except BaseException:
             stopped = False
         require(stopped, 'rollback_could_not_stop_all_writers')
+        try:
+            self.cleanup_migration_tmp()
+        except Exception:
+            # A cleanup problem must not prevent a full data rollback.
+            self.recovery_event('migration_scratch_retained_cleanup_unavailable')
         self.restore_full_data()
         if self.state.get('nginx_intent'):
             before = (self.run / 'nginx-before.conf').read_bytes()
@@ -906,6 +937,34 @@ class RollbackTests(unittest.TestCase):
         self.assertEqual(tree_manifest(self.data), expected)
         self.assertFalse(ready.exists())
         self.assertIn(('docker', 'start', 'old-id'), self.commands)
+
+    def prepare_scratch_cleanup(self):
+        scratch = self.run / 'migration-tmp'
+        scratch.mkdir(mode=0o700)
+        (scratch / 'sqlite-scratch').write_bytes(b'temporary')
+        self.op.calibrator_lock = (self.base / 'calibrator.lock').open('a')
+        self.op.unit_states = lambda: self.op.state['units']
+        return scratch
+
+    def test_scratch_cleanup_keeps_backups_and_requires_stopped_writers(self):
+        expected = self.make_backup()
+        scratch = self.prepare_scratch_cleanup()
+        self.op.inspect = lambda *args, **kwargs: {'State': {'Running': True}}
+        with self.assertRaisesRegex(SafeFailure, '^scratch_cleanup_requires_stopped_containers$'):
+            self.op.cleanup_migration_tmp()
+        self.assertTrue((scratch / 'sqlite-scratch').exists())
+        self.op.inspect = lambda *args, **kwargs: {'State': {'Running': False}}
+        self.op.cleanup_migration_tmp()
+        self.assertFalse(scratch.exists())
+        self.assertEqual(tree_manifest(self.run / 'backup-data'), expected)
+        self.assertEqual(tree_manifest(self.data), expected)
+
+    def test_scratch_cleanup_rejects_link_to_backup(self):
+        expected = self.make_backup()
+        (self.run / 'migration-tmp').symlink_to(self.run / 'backup-data', target_is_directory=True)
+        with self.assertRaises(SafeFailure):
+            self.op.cleanup_migration_tmp()
+        self.assertEqual(tree_manifest(self.run / 'backup-data'), expected)
 
     def test_only_exact_nginx_removal_is_accepted(self):
         before = b'prefix\n' + NGINX_REMOVAL.encode() + b'other-config\n'

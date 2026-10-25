@@ -191,6 +191,10 @@ jobs:
             --jq '.data.repository.release.isLatest')"
           echo "is_latest=$is_latest" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize container repository name
+        shell: bash
+        run: echo "IMAGE_NAME=$(printf '%s' "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5

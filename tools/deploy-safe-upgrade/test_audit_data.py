@@ -25,7 +25,7 @@ class AuditDataTests(unittest.TestCase):
         self.ns = 1792483200123456789
         for root in (self.source, self.candidate):
             root.mkdir()
-            with sqlite3.connect(root / 'komari.db') as db:
+            with contextlib.closing(sqlite3.connect(root / 'komari.db')) as db, db:
                 columns = audit_data.CLIENT_COLUMNS.split(',')
                 db.execute('create table clients(' + ','.join(columns) + ')')
                 row = ['private-node-uuid', 'private-token', 'private-name', 1, 30, 'USD', 1000,
@@ -46,14 +46,14 @@ class AuditDataTests(unittest.TestCase):
                 zero = '0001-01-01 00:00:00' if root == self.source else '0001-01-01T00:00:00Z'
                 db.execute('insert into traffic_reset_reminders values(?,?,?)', ('private-node-uuid', '2026-10-20', stamp))
                 db.execute('insert into ssh_login_events values(?,?,?,?,?)', ('private-event-id', 'private-node-uuid', '192.0.2.1', stamp, zero))
-        with sqlite3.connect(self.source / 'metrics.db') as db:
+        with contextlib.closing(sqlite3.connect(self.source / 'metrics.db')) as db, db:
             db.executescript('''
                 create table metric_points(metric_name text, entity_id text, value real, ts_nano integer);
                 create table metric_rollups(metric_name text, entity_id text, last_val real, last_ts integer);
             ''')
             for metric, value in [('net.total.up', 11), ('net.total.down', 22)]:
                 db.execute('insert into metric_points values(?,?,?,?)', (metric, 'private-node-uuid', value, self.ns))
-        with sqlite3.connect(self.candidate / 'metrics.db') as db:
+        with contextlib.closing(sqlite3.connect(self.candidate / 'metrics.db')) as db, db:
             db.executescript('''
                 create table metric_series(id integer, metric_name text, entity_id text);
                 create table metric_resolutions(id integer, resolution_milli integer);
@@ -78,7 +78,7 @@ class AuditDataTests(unittest.TestCase):
             self.assertNotIn(private, output)
 
     def test_lost_counter_fails(self):
-        with sqlite3.connect(self.candidate / 'metrics.db') as db:
+        with contextlib.closing(sqlite3.connect(self.candidate / 'metrics.db')) as db, db:
             db.execute('delete from metric_rollups where series_id=2')
         result = self.result()
         self.assertFalse(result['passed'])
@@ -88,7 +88,7 @@ class AuditDataTests(unittest.TestCase):
 
     def test_both_empty_counter_sets_fail(self):
         for root, table in ((self.source, 'metric_points'), (self.candidate, 'metric_rollups')):
-            with sqlite3.connect(root / 'metrics.db') as db:
+            with contextlib.closing(sqlite3.connect(root / 'metrics.db')) as db, db:
                 db.execute('delete from ' + table)
         result = self.result()
         self.assertFalse(result['passed'])
@@ -96,9 +96,9 @@ class AuditDataTests(unittest.TestCase):
         self.assertTrue(result['checks']['missing_traffic_counters_unchanged'])
 
     def test_same_missing_offline_counter_does_not_require_all_nodes(self):
-        with sqlite3.connect(self.source / 'metrics.db') as db:
+        with contextlib.closing(sqlite3.connect(self.source / 'metrics.db')) as db, db:
             db.execute("delete from metric_points where metric_name='net.total.down'")
-        with sqlite3.connect(self.candidate / 'metrics.db') as db:
+        with contextlib.closing(sqlite3.connect(self.candidate / 'metrics.db')) as db, db:
             db.execute('delete from metric_rollups where series_id=2')
         self.assertTrue(self.result()['passed'])
 
@@ -110,13 +110,13 @@ class AuditDataTests(unittest.TestCase):
         )
         for query, restore in changes:
             with self.subTest(query=query):
-                with sqlite3.connect(self.candidate / 'komari.db') as db:
+                with contextlib.closing(sqlite3.connect(self.candidate / 'komari.db')) as db, db:
                     db.execute(query)
                 result = self.result()
                 self.assertTrue(result['checks']['node_and_custom_table_counts'])
                 self.assertFalse(result['checks']['custom_notification_contents'])
                 self.assertFalse(result['passed'])
-                with sqlite3.connect(self.candidate / 'komari.db') as db:
+                with contextlib.closing(sqlite3.connect(self.candidate / 'komari.db')) as db, db:
                     db.execute(restore)
 
     def test_timestamp_epoch_precision_and_utc_default(self):
@@ -127,7 +127,7 @@ class AuditDataTests(unittest.TestCase):
         self.assertIsNone(normalize(None))
 
     def test_invalid_timestamp_fails_without_leaking_value(self):
-        with sqlite3.connect(self.candidate / 'komari.db') as db:
+        with contextlib.closing(sqlite3.connect(self.candidate / 'komari.db')) as db, db:
             db.execute("update traffic_reset_reminders set sent_at='private-invalid-value'")
         output = io.StringIO()
         argv = ['audit_data.py', '--source', str(self.source), '--candidate', str(self.candidate), '--legacy-timezone', 'Asia/Shanghai']

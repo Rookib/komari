@@ -81,7 +81,7 @@ func (m *Module) prepareFSAsync(vm *goja.Runtime, name string, arguments []goja.
 	case "writeFile", "appendFile":
 		pathName := fsArgument(arguments, 0).String()
 		data := append([]byte(nil), buffer.Bytes(vm, fsArgument(arguments, 1))...)
-		mode := fsMode(fsArgument(arguments, 2), 0o666)
+		mode := fsWriteMode(fsArgument(arguments, 2))
 		appendMode := name == "appendFile"
 		return fsAsyncOperation{run: func() (any, error) {
 			path, err := follow(pathName, true)

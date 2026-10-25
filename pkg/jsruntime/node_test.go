@@ -51,6 +51,105 @@ func TestNodeCoreModulesAndECMAScriptBuiltins(t *testing.T) {
 	}
 }
 
+func TestNodeFSWriteOptionsPreservePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permission modes are not supported on Windows")
+	}
+	baseDir := t.TempDir()
+	runtime, err := New(`
+		async function write(method, surface, name, options) {
+			const fs = require("fs");
+			if (surface === "sync") {
+				fs[method + "Sync"](name, "data", options);
+			} else if (surface === "promise") {
+				await fs.promises[method](name, "data", options);
+			} else {
+				await new Promise((resolve, reject) => {
+					fs[method](name, "data", options, (error) => error ? reject(error) : resolve());
+				});
+			}
+			return true;
+		}
+	`, Options{NodeJS: true, BaseDir: baseDir, Console: io.Discard, Timeout: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	for _, method := range []string{"writeFile", "appendFile"} {
+		for _, surface := range []string{"sync", "callback", "promise"} {
+			for _, test := range []struct {
+				name    string
+				options any
+				mode    os.FileMode
+			}{
+				{"default", nil, 0o666},
+				{"encoding", "utf8", 0o666},
+				{"encodingObject", map[string]any{"encoding": "utf8"}, 0o666},
+				{"private", map[string]any{"encoding": "utf8", "mode": 0o600}, 0o600},
+				{"octalMode", map[string]any{"mode": "0600"}, 0o600},
+				{"noPermissions", map[string]any{"mode": 0}, 0},
+			} {
+				t.Run(method+"/"+surface+"/"+test.name, func(t *testing.T) {
+					name := method + "-" + surface + "-" + test.name
+					// Compare with ordinary OS creation so the test respects the
+					// process umask, and catches mode 0000 even when run as root.
+					reference := filepath.Join(baseDir, name+"-reference")
+					if err := os.WriteFile(reference, []byte("data"), test.mode); err != nil {
+						t.Fatal(err)
+					}
+					want, err := os.Stat(reference)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := runtime.Call("write", method, surface, name, test.options); err != nil {
+						t.Fatal(err)
+					}
+					got, err := os.Stat(filepath.Join(baseDir, name))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got.Mode().Perm() != want.Mode().Perm() {
+						t.Fatalf("created mode %04o; want %04o", got.Mode().Perm(), want.Mode().Perm())
+					}
+				})
+			}
+			t.Run(method+"/"+surface+"/existingPrivateFile", func(t *testing.T) {
+				name := method + "-" + surface + "-existing"
+				path := filepath.Join(baseDir, name)
+				if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := runtime.Call("write", method, surface, name, "utf8"); err != nil {
+					t.Fatal(err)
+				}
+				after, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if after.Mode().Perm() != before.Mode().Perm() {
+					t.Fatalf("existing permissions changed from %04o to %04o", before.Mode().Perm(), after.Mode().Perm())
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := "data"
+				if method == "appendFile" {
+					want = "beforedata"
+				}
+				if string(data) != want {
+					t.Fatalf("file content %q; want %q", data, want)
+				}
+			})
+		}
+	}
+}
+
 func TestNodeFileAccessConfinementAndAllowAll(t *testing.T) {
 	root := t.TempDir()
 	baseDir := filepath.Join(root, "base")

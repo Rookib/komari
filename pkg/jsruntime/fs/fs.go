@@ -299,7 +299,7 @@ func (m *Module) Load(vm *goja.Runtime, module *goja.Object) {
 			panic(vm.NewGoError(err))
 		}
 		data := buffer.Bytes(vm, call.Argument(1))
-		if err := m.nodeWriteFile(path, data, fsMode(call.Argument(2), 0o666)); err != nil {
+		if err := m.nodeWriteFile(path, data, fsWriteMode(call.Argument(2))); err != nil {
 			panic(vm.NewGoError(err))
 		}
 		return goja.Undefined()
@@ -309,7 +309,7 @@ func (m *Module) Load(vm *goja.Runtime, module *goja.Object) {
 		if err != nil {
 			panic(vm.NewGoError(err))
 		}
-		file, err := m.nodeOpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, fsMode(call.Argument(2), 0o666))
+		file, err := m.nodeOpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, fsWriteMode(call.Argument(2)))
 		if err == nil {
 			_, writeErr := file.Write(buffer.Bytes(vm, call.Argument(1)))
 			err = errors.Join(writeErr, file.Close())
@@ -689,6 +689,15 @@ func encodeFSData(vm *goja.Runtime, data []byte, encoding string) goja.Value {
 		return buffer.WrapBytes(vm, data)
 	}
 	return vm.ToValue(buffer.EncodeBytes(vm, data, vm.ToValue(encoding)))
+}
+
+// A string writeFile/appendFile option is an encoding, not a file mode.
+// Keep mode parsing separate from open/mkdir, which also accept mode strings.
+func fsWriteMode(options goja.Value) os.FileMode {
+	if _, ok := options.(goja.String); ok {
+		return 0o666
+	}
+	return fsMode(options, 0o666)
 }
 
 func fsMode(value goja.Value, fallback os.FileMode) os.FileMode {

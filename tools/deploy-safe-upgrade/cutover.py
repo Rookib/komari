@@ -228,13 +228,16 @@ class Cutover:
         require(isinstance(value, list) and len(value) == 1, 'container_inspect_shape')
         return value[0]
 
-    def unit_states(self):
+    def unit_states(self, allow_activating_service=False):
         result = {}
         for unit in UNITS:
             raw = self.cmd(['systemctl', 'show', unit, '--property=LoadState,ActiveState,UnitFileState']).stdout
             fields = dict(line.split('=', 1) for line in raw.decode().splitlines() if '=' in line)
+            allowed = {'active', 'inactive', 'failed'}
+            if allow_activating_service and unit == 'dmit-wan-calibrator.service':
+                allowed.add('activating')
             require(fields.get('LoadState') == 'loaded' and
-                    fields.get('ActiveState') in ('active', 'inactive', 'failed'), 'calibrator_state_not_stable')
+                    fields.get('ActiveState') in allowed, 'calibrator_state_not_stable')
             result[unit] = fields
         return result
 
@@ -264,8 +267,10 @@ class Cutover:
             self.calibrator_lock = None
 
     def restore_units(self):
+        self.recovery_record(phase='restoring_calibrator')
+        self.recovery_event('restoring_calibrator')
         self.unlock_calibrator()
-        current = self.unit_states()
+        current = self.unit_states(allow_activating_service=True)
         for unit, original in self.state['units'].items():
             require(current[unit]['UnitFileState'] == original['UnitFileState'],
                     'calibrator_enablement_changed_externally')
@@ -274,7 +279,10 @@ class Cutover:
         for unit in reversed(UNITS):
             if self.state['units'][unit]['ActiveState'] == 'active':
                 self.cmd(['systemctl', 'start', unit])
-        restored = self.unit_states()
+        # Starting a path/timer can legitimately start its one-shot service.
+        # Only this restoration observation permits that service's activating
+        # state; stop/lock preconditions keep the strict default.
+        restored = self.unit_states(allow_activating_service=True)
         for unit in UNITS[:2]:
             wanted = self.state['units'][unit]['ActiveState']
             require(restored[unit]['ActiveState'] == wanted or
@@ -1006,6 +1014,61 @@ class RollbackTests(unittest.TestCase):
         self.assertNotIn(str(missing).encode(), result.stdout)
         self.assertNotIn(b'Traceback', result.stdout)
         self.assertFalse(missing.exists())
+
+    def configure_unit_state_sequence(self, activating_trigger=False, stopping=False):
+        original = {unit: {'LoadState': 'loaded', 'UnitFileState': 'enabled',
+                          'ActiveState': 'active' if unit != UNITS[-1] else 'failed'} for unit in UNITS}
+        original[UNITS[-1]]['UnitFileState'] = 'static'
+        self.op.state['units'] = original
+        active = {unit: 'inactive' for unit in UNITS}
+        active[UNITS[-1]] = 'activating' if stopping else 'failed'
+        def command(args, **kwargs):
+            args = tuple(str(value) for value in args)
+            self.commands.append(args)
+            output = b''
+            if args[:2] == ('systemctl', 'show'):
+                unit = args[2]
+                fields = {**original[unit], 'ActiveState': active[unit]}
+                output = ''.join(key + '=' + value + '\n' for key, value in fields.items()).encode()
+            elif args[:2] == ('systemctl', 'start'):
+                active[args[2]] = 'activating' if activating_trigger and args[2] == UNITS[1] else 'active'
+                active[UNITS[-1]] = 'activating'
+            return subprocess.CompletedProcess(args, 0, output, b'')
+        self.op.cmd = command
+        return active
+
+    def test_restored_triggers_starting_oneshot_do_not_roll_back_upgrade(self):
+        self.make_backup()
+        self.op.state['swap_intent'] = False
+        self.op.preflight = lambda: None
+        def prepare():
+            shutil.copytree(self.run / 'backup-data', self.run / 'candidate-data')
+            (self.run / 'candidate-data/komari.db').write_bytes(b'migrated')
+            self.op.state['candidate_ready'] = True
+        self.op.migrate_and_audit = prepare
+        self.op.start_candidate = lambda: None
+        self.op.apply_nginx = lambda: None
+        active = self.configure_unit_state_sequence()
+        self.op.restore_units = lambda: Cutover.restore_units(self.op)
+        self.op.execute()
+        self.assertEqual(active[UNITS[-1]], 'activating')
+        self.assertTrue(self.op.state['committed'])
+        self.assertFalse(self.op.state.get('rolled_back', False))
+        self.assertNotIn(('stop-new',), self.commands)
+        self.assertEqual((self.data / 'komari.db').read_bytes(), b'migrated')
+
+    def test_restoration_rejects_activating_trigger(self):
+        self.configure_unit_state_sequence(activating_trigger=True)
+        with self.assertRaisesRegex(SafeFailure, '^calibrator_state_not_stable$'):
+            Cutover.restore_units(self.op)
+        self.assertEqual(self.op.state['phase'], 'restoring_calibrator')
+
+    def test_stop_still_rejects_activating_service(self):
+        self.configure_unit_state_sequence(stopping=True)
+        with self.assertRaisesRegex(SafeFailure, '^calibrator_state_not_stable$'):
+            Cutover.stop_units(self.op)
+        self.assertTrue(all(('systemctl', 'stop', unit) in self.commands for unit in UNITS))
+        self.assertFalse(any(command[:2] == ('systemctl', 'start') for command in self.commands))
 
 
 def interrupted(signum, frame):

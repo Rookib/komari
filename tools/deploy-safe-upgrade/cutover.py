@@ -988,6 +988,25 @@ class RollbackTests(unittest.TestCase):
             self.assertEqual(main([]), 0)
         self.assertEqual(self.commands, [])
 
+    def test_real_entrypoint_preflight_failure_emits_only_safe_json(self):
+        # The nonexistent private root guarantees this child cannot reach Docker
+        # even when this test is run by root on Linux. Other platforms/users fail
+        # the earlier execution guard. Exercise the actual __main__ error path.
+        missing = self.base / 'private-path-must-not-appear-in-error'
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), '--execute', '--root', str(missing)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, b'')
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report), {'event', 'error_code'})
+        self.assertEqual(report['event'], 'failed')
+        self.assertIn(report['error_code'], ('execute_requires_root_linux_host', 'required_path_missing'))
+        self.assertNotIn(str(missing).encode(), result.stdout)
+        self.assertNotIn(b'Traceback', result.stdout)
+        self.assertFalse(missing.exists())
+
 
 def interrupted(signum, frame):
     raise SafeFailure('interrupted')
@@ -999,9 +1018,9 @@ if __name__ == '__main__':
     try:
         raise SystemExit(main())
     except SafeFailure as error:
-        event('failed', code=str(error))
+        event('failed', error_code=str(error))
         raise SystemExit(1)
     except Exception:
         # Do not print traceback, exception text, subprocess output or credentials.
-        event('failed', code='unexpected_error_details_suppressed')
+        event('failed', error_code='unexpected_error_details_suppressed')
         raise SystemExit(1)

@@ -16,7 +16,7 @@ import (
 )
 
 func TestValidateOptionsRejectsUnsafeTargetsBeforeMutation(t *testing.T) {
-	for _, name := range []string{"missing acknowledgement", "missing backup", "nested backup", "hardlink backup", "outside metric", "network metric", "legacy history", "pending restore", "invalid timezone"} {
+	for _, name := range []string{"missing acknowledgement", "missing backup", "nested backup", "hardlink backup", "hardlink main metric", "hardlink snapshot databases", "cross-database backup hardlink", "outside metric", "network metric", "legacy history", "pending restore", "invalid timezone"} {
 		t.Run(name, func(t *testing.T) {
 			opts := createFixture(t)
 			switch name {
@@ -37,6 +37,22 @@ func TestValidateOptionsRejectsUnsafeTargetsBeforeMutation(t *testing.T) {
 				if err := os.Link(filepath.Join(opts.dataDir, "metrics.db"), path); err != nil {
 					t.Fatal(err)
 				}
+			case "hardlink main metric", "hardlink snapshot databases", "cross-database backup hardlink":
+				source := filepath.Join(opts.dataDir, "komari.db")
+				target := filepath.Join(opts.dataDir, "metrics.db")
+				if name == "hardlink snapshot databases" {
+					source = filepath.Join(opts.backupDir, "komari.db")
+					target = filepath.Join(opts.backupDir, "metrics.db")
+				} else if name == "cross-database backup hardlink" {
+					source = filepath.Join(opts.dataDir, "metrics.db")
+					target = filepath.Join(opts.backupDir, "komari.db")
+				}
+				if err := os.Remove(target); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(source, target); err != nil {
+					t.Fatal(err)
+				}
 			case "outside metric":
 				setFixtureConfig(t, opts, "metric_db_dsn", filepath.Join(opts.backupDir, "metrics.db"))
 			case "network metric":
@@ -55,6 +71,7 @@ func TestValidateOptionsRejectsUnsafeTargetsBeforeMutation(t *testing.T) {
 				opts.timezone = "not/a/timezone"
 			}
 			before := fileDigest(t, filepath.Join(opts.dataDir, "komari.db"))
+			metricsBefore := fileDigest(t, filepath.Join(opts.dataDir, "metrics.db"))
 			_, err := validateOptions(opts)
 			if err == nil {
 				t.Fatal("unsafe input was accepted")
@@ -64,6 +81,9 @@ func TestValidateOptionsRejectsUnsafeTargetsBeforeMutation(t *testing.T) {
 			}
 			if after := fileDigest(t, filepath.Join(opts.dataDir, "komari.db")); before != after {
 				t.Fatal("preflight changed main database")
+			}
+			if after := fileDigest(t, filepath.Join(opts.dataDir, "metrics.db")); metricsBefore != after {
+				t.Fatal("preflight changed metric database")
 			}
 		})
 	}

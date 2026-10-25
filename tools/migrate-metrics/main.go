@@ -193,6 +193,22 @@ func validateOptions(opts options) (paths, error) {
 	if err := validateSnapshotFile(p.data, p.backup, rel); err != nil {
 		return p, err
 	}
+	// Different names are not enough: a hard link can alias the main database,
+	// the metric database, or either backup. Verify all four files are distinct
+	// before opening any of them for writes.
+	var databaseFiles []os.FileInfo
+	for _, path := range []string{p.mainDB, p.metricsDB, filepath.Join(p.backup, "komari.db"), filepath.Join(p.backup, rel)} {
+		info, err := os.Stat(path)
+		if err != nil {
+			return p, errors.New("cannot verify database file identities")
+		}
+		for _, previous := range databaseFiles {
+			if os.SameFile(previous, info) {
+				return p, errors.New("main, metric, and snapshot databases must be independent files")
+			}
+		}
+		databaseFiles = append(databaseFiles, info)
+	}
 	return p, nil
 }
 

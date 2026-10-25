@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/config"
-	"github.com/komari-monitor/komari/protocol/v1"
+	"github.com/komari-monitor/komari/internal/config"
+	"github.com/komari-monitor/komari/protocol/v2"
 )
 
 const (
@@ -173,7 +173,7 @@ func LastFailureReason(uuid string) (string, bool) {
 	return cfg.LastError, true
 }
 
-func ApplyReportOverride(uuid string, report *v1.Report) bool {
+func ApplyReportOverride(uuid string, report *v2.Report) bool {
 	if report == nil {
 		return false
 	}

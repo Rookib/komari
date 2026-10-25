@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 )
 
 // CorsController 保存 CORS 中间件的可热更新状态。
@@ -107,16 +107,6 @@ func (ctrl *CorsController) Middleware() gin.HandlerFunc {
 
 		c.Next()
 	}
-}
-
-// CorsMiddleware 保留原有签名：内部自建 controller 并自行订阅配置事件。
-// 供测试以及不接入集中式 reload 管理器的场景使用。
-func CorsMiddleware(initialEnabled bool, initialAllowedOrigins string) gin.HandlerFunc {
-	ctrl := NewCorsController(initialEnabled, initialAllowedOrigins)
-	config.Subscribe(func(event config.ConfigEvent) {
-		ctrl.Update(event)
-	})
-	return ctrl.Middleware()
 }
 
 func isAPIRequestPath(path string) bool {

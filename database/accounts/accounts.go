@@ -4,14 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"os"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/utils"
-
-	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 const constantSalt = "06Wm4Jv1Hkxx"
@@ -56,7 +54,10 @@ func hashPasswd(passwd string) string {
 }
 
 func CreateAccount(username, passwd string) (user models.User, err error) {
-	db := dbcore.GetDBInstance()
+	return CreateAccountWithDB(dbcore.GetDBInstance(), username, passwd)
+}
+
+func CreateAccountWithDB(db *gorm.DB, username, passwd string) (user models.User, err error) {
 	hashedPassword := hashPasswd(passwd)
 	user = models.User{
 		UUID:     uuid.New().String(),
@@ -71,45 +72,15 @@ func CreateAccount(username, passwd string) (user models.User, err error) {
 }
 
 func DeleteAccountByUsername(username string) (err error) {
-	db := dbcore.GetDBInstance()
+	return DeleteAccountByUsernameWithDB(dbcore.GetDBInstance(), username)
+}
+
+func DeleteAccountByUsernameWithDB(db *gorm.DB, username string) (err error) {
 	err = db.Where("username = ?", username).Delete(&models.User{}).Error
 	if err != nil {
 		return err
 	}
 	return nil
-}
-
-// 创建默认管理员账户，使用环境变量 ADMIN_USERNAME 作为用户名，环境变量 ADMIN_PASSWORD 作为密码
-func CreateDefaultAdminAccount() (username, passwd string, err error) {
-	db := dbcore.GetDBInstance()
-
-	username = os.Getenv("ADMIN_USERNAME")
-	if username == "" {
-		username = "admin"
-	}
-
-	passwd = os.Getenv("ADMIN_PASSWORD")
-	if passwd == "" {
-		passwd = utils.GeneratePassword()
-	}
-
-	hashedPassword := hashPasswd(passwd)
-
-	user := models.User{
-		UUID:      uuid.New().String(),
-		Username:  username,
-		Passwd:    hashedPassword,
-		SSOID:     "",
-		CreatedAt: models.FromTime(time.Now()),
-		UpdatedAt: models.FromTime(time.Now()),
-	}
-
-	err = db.Create(&user).Error
-	if err != nil {
-		return "", "", err
-	}
-
-	return username, passwd, nil
 }
 
 func GetUserByUUID(uuid string) (user models.User, err error) {
@@ -171,7 +142,7 @@ func UpdateUser(uuid string, name, password, sso_type *string) error {
 	if sso_type != nil {
 		updates["sso_type"] = *sso_type
 	}
-	updates["updated_at"] = time.Now()
+	updates["updated_at"] = time.Now().UTC()
 	err := db.Model(&models.User{}).Where("uuid = ?", uuid).Updates(updates).Error
 	if err != nil {
 		return err

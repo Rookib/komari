@@ -1,10 +1,13 @@
 package clients
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"github.com/komari-monitor/komari/internal/metricstore"
+	logger "github.com/komari-monitor/komari/utils/log"
+	"gorm.io/gorm"
 	"math"
 	"strings"
 	"time"
@@ -13,7 +16,6 @@ import (
 	"github.com/komari-monitor/komari/database/models"
 	"github.com/komari-monitor/komari/database/tasks"
 	"github.com/komari-monitor/komari/utils"
-	"gorm.io/gorm"
 
 	"github.com/google/uuid"
 )
@@ -39,7 +41,7 @@ func SaveClientInfo(update map[string]interface{}) error {
 		return fmt.Errorf("no fields to update")
 	}
 
-	update["updated_at"] = time.Now()
+	update["updated_at"] = time.Now().UTC()
 
 	toFloat64 := func(value interface{}) (float64, bool) {
 		switch typed := value.(type) {
@@ -88,7 +90,7 @@ func SaveClientInfo(update map[string]interface{}) error {
 		if !ok {
 			return fmt.Errorf("%s must be a valid number", name)
 		}
-		if numericValue < 0 || numericValue > maxValue {
+		if math.IsNaN(numericValue) || math.IsInf(numericValue, 0) || math.Trunc(numericValue) != numericValue || numericValue < 0 || numericValue > maxValue || numericValue >= float64(math.MaxInt64) {
 			return fmt.Errorf("%s must be a valid non-negative number: %v", name, value)
 		}
 		return nil
@@ -170,7 +172,7 @@ func normalizeVnstatBasicInfo(db *gorm.DB, clientUUID string, update map[string]
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
-	if !existing.VnstatBaselineAt.ToTime().IsZero() {
+	if !existing.VnstatBaselineAt.IsZero() {
 		return nil
 	}
 
@@ -187,7 +189,7 @@ func normalizeVnstatBasicInfo(db *gorm.DB, clientUUID string, update map[string]
 	update["vnstat_baseline_down"] = latest.Down
 	update["vnstat_baseline_vn_up"] = vnUp
 	update["vnstat_baseline_vn_down"] = vnDown
-	update["vnstat_baseline_at"] = models.FromTime(time.Now())
+	update["vnstat_baseline_at"] = time.Now().UTC()
 	return nil
 }
 
@@ -220,7 +222,7 @@ func int64FromUpdate(value interface{}) (int64, bool) {
 		}
 		return int64(typed), true
 	case float64:
-		if typed < 0 || typed > math.MaxInt64 || math.Trunc(typed) != typed {
+		if typed < 0 || typed >= float64(math.MaxInt64) || math.IsNaN(typed) || math.IsInf(typed, 0) || math.Trunc(typed) != typed {
 			return 0, false
 		}
 		return int64(typed), true
@@ -240,37 +242,15 @@ type trafficTotalsBaseline struct {
 	Down int64
 }
 
-func latestTrafficTotalsForBaseline(db *gorm.DB, clientUUID string) (trafficTotalsBaseline, error) {
-	latest, err := latestTrafficRecordForBaseline(db.Table("records"), clientUUID)
+func latestTrafficTotalsForBaseline(_ *gorm.DB, clientUUID string) (trafficTotalsBaseline, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	records, err := metricstore.GetLatestTrafficBefore(ctx, []string{clientUUID}, time.Now().UTC())
 	if err != nil {
 		return trafficTotalsBaseline{}, err
 	}
-	longTerm, err := latestTrafficRecordForBaseline(db.Table("records_long_term"), clientUUID)
-	if err != nil {
-		return trafficTotalsBaseline{}, err
-	}
-	if latest == nil || (longTerm != nil && longTerm.Time.ToTime().After(latest.Time.ToTime())) {
-		latest = longTerm
-	}
-	if latest == nil {
-		return trafficTotalsBaseline{}, nil
-	}
+	latest := records[clientUUID]
 	return trafficTotalsBaseline{Up: latest.NetTotalUp, Down: latest.NetTotalDown}, nil
-}
-
-func latestTrafficRecordForBaseline(query *gorm.DB, clientUUID string) (*models.Record, error) {
-	var record models.Record
-	err := query.Select("time, net_total_up, net_total_down").
-		Where("client = ?", clientUUID).
-		Order("time DESC").
-		First(&record).Error
-	if err == nil {
-		return &record, nil
-	}
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil
-	}
-	return nil, err
 }
 
 func EditClientName(clientUUID, clientName string) error {
@@ -301,8 +281,8 @@ func CreateClient() (clientUUID, token string, err error) {
 		UUID:      clientUUID,
 		Token:     token,
 		Name:      "client_" + clientUUID[0:8],
-		CreatedAt: models.FromTime(time.Now()),
-		UpdatedAt: models.FromTime(time.Now()),
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
 	}
 
 	err = db.Create(&client).Error
@@ -310,7 +290,7 @@ func CreateClient() (clientUUID, token string, err error) {
 		return "", "", err
 	}
 	if err := tasks.AddDefaultOnClientUUID(clientUUID); err != nil {
-		log.Println("Failed to apply default-on ping tasks to new client:", err)
+		logger.ErrorArgs("clients", "Failed to apply default-on ping tasks to new client:", err)
 	}
 	return clientUUID, token, nil
 }
@@ -326,8 +306,8 @@ func CreateClientWithName(name string) (clientUUID, token string, err error) {
 		UUID:      clientUUID,
 		Token:     token,
 		Name:      name,
-		CreatedAt: models.FromTime(time.Now()),
-		UpdatedAt: models.FromTime(time.Now()),
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
 	}
 
 	err = db.Create(&client).Error
@@ -335,7 +315,7 @@ func CreateClientWithName(name string) (clientUUID, token string, err error) {
 		return "", "", err
 	}
 	if err := tasks.AddDefaultOnClientUUID(clientUUID); err != nil {
-		log.Println("Failed to apply default-on ping tasks to new client:", err)
+		logger.ErrorArgs("clients", "Failed to apply default-on ping tasks to new client:", err)
 	}
 	return clientUUID, token, nil
 }
@@ -356,19 +336,6 @@ func GetClientByUUID(uuid string) (client models.Client, err error) {
 	db := dbcore.GetDBInstance()
 	err = db.Where("uuid = ?", uuid).First(&client).Error
 	if err != nil {
-		return models.Client{}, err
-	}
-	return client, nil
-}
-
-// GetClientBasicInfo 获取指定 UUID 的客户端基本信息
-func GetClientBasicInfo(uuid string) (client models.Client, err error) {
-	db := dbcore.GetDBInstance()
-	err = db.Where("uuid = ?", uuid).First(&client).Error
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return models.Client{}, fmt.Errorf("客户端不存在: %s", uuid)
-		}
 		return models.Client{}, err
 	}
 	return client, nil
@@ -412,8 +379,30 @@ func SaveClient(updates map[string]interface{}) error {
 			}
 		}
 	}
+	if value, exists := updates["expired_at"]; exists {
+		switch typed := value.(type) {
+		case nil:
+			updates["expired_at"] = nil
+		case time.Time:
+			updates["expired_at"] = typed.UTC()
+		case *time.Time:
+			if typed == nil {
+				updates["expired_at"] = nil
+			} else {
+				updates["expired_at"] = typed.UTC()
+			}
+		case string:
+			stamp, err := time.Parse(time.RFC3339Nano, typed)
+			if err != nil {
+				return fmt.Errorf("expired_at must be an RFC3339 timestamp with a timezone: %w", err)
+			}
+			updates["expired_at"] = stamp.UTC()
+		default:
+			return fmt.Errorf("expired_at must be an RFC3339 timestamp with a timezone")
+		}
+	}
 
-	updates["updated_at"] = time.Now()
+	updates["updated_at"] = time.Now().UTC()
 
 	err := db.Model(&models.Client{}).Where("uuid = ?", clientUUID).Updates(updates).Error
 	if err != nil {

@@ -46,11 +46,10 @@ func (s *Store) MaintenanceAction() MaintenanceAction {
 
 // StorageSize returns the physical bytes occupied by this Store. SQLite
 // includes the main database, WAL, and shared-memory files. Server backends
-// include only the definitions, points, and rollups tables managed by Store.
+// include only the definition, dictionary, and rollup tables managed by Store.
 //
 // StorageSize 返回当前 Store 占用的物理字节数。SQLite 会统计主数据库、WAL
-// 和共享内存文件；服务端数据库只统计 Store 管理的 definitions、points 和
-// rollups 三张表。
+// 和共享内存文件；服务端数据库只统计 Store 管理的定义、字典和 rollup 表。
 func (s *Store) StorageSize(ctx context.Context) (int64, error) {
 	s.maintenanceMu.RLock()
 	defer s.maintenanceMu.RUnlock()
@@ -76,6 +75,22 @@ func (s *Store) StorageSize(ctx context.Context) (int64, error) {
 	return size, nil
 }
 
+// CheckpointWAL copies committed SQLite WAL pages into the main database and
+// truncates the sidecar. Other backends have no local WAL sidecar.
+func (s *Store) CheckpointWAL(ctx context.Context) error {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed || s.db == nil {
+		return ErrClosed
+	}
+	if s.cfg.Driver != DriverSQLite {
+		return nil
+	}
+	return sqliteCheckpoint(ctx, s.db)
+}
+
 // ReclaimSpace performs the backend-specific blocking operation that returns
 // unused database pages to the filesystem. It serializes against other
 // maintenance calls and keeps Close from closing the pool mid-operation.
@@ -83,6 +98,10 @@ func (s *Store) StorageSize(ctx context.Context) (int64, error) {
 // ReclaimSpace 执行后端专用的阻塞式空间回收操作。该方法会与其他维护调用
 // 串行执行，并阻止 Close 在操作过程中关闭连接池。
 func (s *Store) ReclaimSpace(ctx context.Context) error {
+	// Space reclamation is an explicit, non-cancellable operation. In
+	// particular VACUUM cannot be resumed safely from a short request deadline;
+	// once admitted, it runs to completion or returns a database error.
+	ctx = context.Background()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 
@@ -91,14 +110,23 @@ func (s *Store) ReclaimSpace(ctx context.Context) error {
 	if s.closed || s.db == nil {
 		return ErrClosed
 	}
+	if _, err := s.cleanupOrphanedMetricData(ctx); err != nil {
+		return err
+	}
 
 	switch s.cfg.Driver {
 	case DriverSQLite:
+		if err := s.reencodeLegacyDigests(ctx); err != nil {
+			return err
+		}
 		if err := sqliteCheckpoint(ctx, s.db); err != nil {
 			return err
 		}
 		if _, err := s.db.ExecContext(ctx, sqliteVacuumSQL); err != nil {
 			return fmt.Errorf("metric: vacuum sqlite database: %w", err)
+		}
+		if _, err := s.db.ExecContext(ctx, "PRAGMA optimize"); err != nil {
+			return fmt.Errorf("metric: optimize sqlite database: %w", err)
 		}
 		// VACUUM itself can populate the WAL; truncate it again so the reported
 		// physical size reflects the completed reclamation.
@@ -121,6 +149,41 @@ func (s *Store) ReclaimSpace(ctx context.Context) error {
 	default:
 		return fmt.Errorf("%w: unsupported driver %q", ErrInvalidArgument, s.cfg.Driver)
 	}
+}
+
+// cleanupOrphanedMetricData removes rows whose metric definition no longer
+// exists. It runs immediately before an explicit space-reclaim operation so
+// the physical rewrite returns the freed pages to the filesystem in the same
+// maintenance window.
+func (s *Store) cleanupOrphanedMetricData(ctx context.Context) (int64, error) {
+	var deleted int64
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		`DELETE FROM %s WHERE NOT EXISTS (SELECT 1 FROM %s s JOIN %s d ON d.name = s.metric_name WHERE s.id = %s.series_id)`,
+		s.tables.rollups, s.tables.series, s.tables.definitions, s.tables.rollups))
+	if err != nil {
+		return deleted, fmt.Errorf("metric: delete orphaned rows from %s: %w", s.tables.rollups, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return deleted, err
+	}
+	deleted += count
+	for _, statement := range []string{
+		fmt.Sprintf(`DELETE FROM %s WHERE NOT EXISTS (SELECT 1 FROM %s r WHERE r.series_id = %s.id)`, s.tables.series, s.tables.rollups, s.tables.series),
+		fmt.Sprintf(`DELETE FROM %s WHERE NOT EXISTS (SELECT 1 FROM %s r WHERE r.label_id = %s.id)`, s.tables.labels, s.tables.rollups, s.tables.labels),
+		fmt.Sprintf(`DELETE FROM %s WHERE NOT EXISTS (SELECT 1 FROM %s r WHERE r.resolution_id = %s.id)`, s.tables.resolutions, s.tables.rollups, s.tables.resolutions),
+	} {
+		result, err := s.db.ExecContext(ctx, statement)
+		if err != nil {
+			return deleted, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return deleted, err
+		}
+		deleted += count
+	}
+	return deleted, nil
 }
 
 func (s *Store) sqliteStorageSize(ctx context.Context) (int64, error) {
@@ -235,21 +298,27 @@ func maintenanceActionFor(driver Driver) MaintenanceAction {
 
 func managedStorageSizeQuery(driver Driver, t tables) (string, []any, error) {
 	names := managedTableNames(t)
+	d := newDialect(driver)
+	placeholders := make([]string, len(names))
+	for i := range names {
+		placeholders[i] = d.placeholder(i + 1)
+	}
+	inClause := strings.Join(placeholders, ", ")
 	switch driver {
 	case DriverMySQL:
-		return `SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0)
+		return fmt.Sprintf(`SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0)
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA = DATABASE()
-  AND TABLE_NAME IN (?, ?, ?)`, stringsToAny(names), nil
+	  AND TABLE_NAME IN (%s)`, inClause), stringsToAny(names), nil
 	case DriverPostgreSQL:
 		for i := range names {
 			names[i] = strings.ToLower(names[i])
 		}
-		return `SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)
+		return fmt.Sprintf(`SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)
 FROM pg_catalog.pg_class AS c
 JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
 WHERE n.nspname = current_schema()
-  AND c.relname IN ($1, $2, $3)`, stringsToAny(names), nil
+	  AND c.relname IN (%s)`, inClause), stringsToAny(names), nil
 	default:
 		return "", nil, fmt.Errorf("%w: storage-size query is unavailable for driver %q", ErrInvalidArgument, driver)
 	}
@@ -276,7 +345,7 @@ func managedReclaimQuery(driver Driver, t tables) (string, error) {
 }
 
 func managedTableNames(t tables) []string {
-	return []string{t.definitions, t.points, t.rollups}
+	return []string{t.definitions, t.series, t.labels, t.resolutions, t.rollups}
 }
 
 func quoteMaintenanceIdentifier(driver Driver, identifier string) string {

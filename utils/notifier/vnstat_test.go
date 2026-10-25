@@ -31,7 +31,7 @@ func TestGetClientVnstatLatestTotalsCarriesAdoptionBaseline(t *testing.T) {
 		VnstatBaselineDown:   2000,
 		VnstatBaselineVnUp:   100,
 		VnstatBaselineVnDown: 200,
-		VnstatBaselineAt:     models.FromTime(time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)),
+		VnstatBaselineAt:     (time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)),
 	}
 
 	totals, ok := GetClientVnstatLatestTotals(client)
@@ -53,7 +53,7 @@ func TestGetClientVnstatCycleTotalsUsesBaselineBeforeFirstReset(t *testing.T) {
 		VnstatBaselineDown:   2000,
 		VnstatBaselineVnUp:   100,
 		VnstatBaselineVnDown: 200,
-		VnstatBaselineAt:     models.FromTime(time.Date(2026, 6, 22, 12, 0, 0, 0, loc)),
+		VnstatBaselineAt:     (time.Date(2026, 6, 22, 12, 0, 0, 0, loc)),
 		VnstatDailyJSON:      `[{"date":"2026-06-22","up":60,"down":70}]`,
 	}
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, loc)
@@ -74,7 +74,7 @@ func TestGetClientVnstatCycleTotalsUsesCumulativeWhenResetDisabled(t *testing.T)
 		VnstatBaselineDown:   2000,
 		VnstatBaselineVnUp:   100,
 		VnstatBaselineVnDown: 200,
-		VnstatBaselineAt:     models.FromTime(time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)),
+		VnstatBaselineAt:     (time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)),
 		VnstatDailyJSON:      `[{"date":"2026-06-01","up":10,"down":20}]`,
 	}
 
@@ -97,7 +97,7 @@ func TestGetClientVnstatCycleTotalsUsesDailyAfterReset(t *testing.T) {
 		VnstatBaselineDown:   2000,
 		VnstatBaselineVnUp:   100,
 		VnstatBaselineVnDown: 200,
-		VnstatBaselineAt:     models.FromTime(time.Date(2026, 6, 22, 12, 0, 0, 0, loc)),
+		VnstatBaselineAt:     (time.Date(2026, 6, 22, 12, 0, 0, 0, loc)),
 		VnstatDailyJSON:      `[{"date":"2026-07-10","up":1,"down":2},{"date":"2026-07-11","up":300,"down":400},{"date":"2026-07-12","up":500,"down":600}]`,
 	}
 	now := time.Date(2026, 7, 12, 12, 0, 0, 0, loc)

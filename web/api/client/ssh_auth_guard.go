@@ -10,7 +10,7 @@ import (
 // UploadSSHAuthGuardAlert accepts an already-aggregated SSH failed-login alert
 // from an authenticated safe agent. The server does not parse raw SSH logs.
 func UploadSSHAuthGuardAlert(c *gin.Context) {
-	uuid, ok := clientUUIDFromContext(c)
+	uuid, ok := securityClientUUIDFromContext(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "Invalid token"})
 		return

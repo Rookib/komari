@@ -48,7 +48,7 @@ func GetClientVnstatLatestTotals(client models.Client) (TrafficTotals, bool) {
 	if !client.VnstatAvailable || (client.VnstatTotalUp == 0 && client.VnstatTotalDown == 0) {
 		return TrafficTotals{}, false
 	}
-	if !client.VnstatBaselineAt.ToTime().IsZero() {
+	if !client.VnstatBaselineAt.IsZero() {
 		return TrafficTotals{
 			Up:   client.VnstatBaselineUp + positiveDelta(client.VnstatTotalUp, client.VnstatBaselineVnUp),
 			Down: client.VnstatBaselineDown + positiveDelta(client.VnstatTotalDown, client.VnstatBaselineVnDown),
@@ -73,7 +73,7 @@ func GetClientVnstatCycleTotals(client models.Client, now time.Time) (TrafficTot
 	now = now.In(loc)
 	resetStart := trafficCycleStart(now, client.TrafficResetDay, loc)
 
-	if !client.VnstatBaselineAt.ToTime().IsZero() && client.VnstatBaselineAt.ToTime().In(loc).After(resetStart) {
+	if !client.VnstatBaselineAt.IsZero() && client.VnstatBaselineAt.In(loc).After(resetStart) {
 		return TrafficTotals{
 			Up:   client.VnstatBaselineUp + positiveDelta(client.VnstatTotalUp, client.VnstatBaselineVnUp),
 			Down: client.VnstatBaselineDown + positiveDelta(client.VnstatTotalDown, client.VnstatBaselineVnDown),

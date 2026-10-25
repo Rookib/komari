@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/komari-monitor/komari/database/models"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -122,11 +121,11 @@ func TestTrafficDeltaOrFallback(t *testing.T) {
 func TestLatestTrafficResetFindsMostRecentCounterDrop(t *testing.T) {
 	start := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 	records := []trafficDeltaRecord{
-		{Time: models.FromTime(start), NetTotalUp: 100, NetTotalDown: 200},
-		{Time: models.FromTime(start.Add(time.Hour)), NetTotalUp: 130, NetTotalDown: 260},
-		{Time: models.FromTime(start.AddDate(0, 1, 0)), NetTotalUp: 5, NetTotalDown: 8},
-		{Time: models.FromTime(start.AddDate(0, 1, 0).Add(time.Hour)), NetTotalUp: 20, NetTotalDown: 30},
-		{Time: models.FromTime(start.AddDate(0, 2, 0)), NetTotalUp: 2, NetTotalDown: 4},
+		{Time: (start), NetTotalUp: 100, NetTotalDown: 200},
+		{Time: (start.Add(time.Hour)), NetTotalUp: 130, NetTotalDown: 260},
+		{Time: (start.AddDate(0, 1, 0)), NetTotalUp: 5, NetTotalDown: 8},
+		{Time: (start.AddDate(0, 1, 0).Add(time.Hour)), NetTotalUp: 20, NetTotalDown: 30},
+		{Time: (start.AddDate(0, 2, 0)), NetTotalUp: 2, NetTotalDown: 4},
 	}
 
 	resetAt, found := latestTrafficReset(records)
@@ -137,8 +136,8 @@ func TestLatestTrafficResetFindsMostRecentCounterDrop(t *testing.T) {
 func TestLatestTrafficResetReturnsNotFound(t *testing.T) {
 	start := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 	records := []trafficDeltaRecord{
-		{Time: models.FromTime(start), NetTotalUp: 100, NetTotalDown: 200},
-		{Time: models.FromTime(start.Add(time.Hour)), NetTotalUp: 130, NetTotalDown: 260},
+		{Time: (start), NetTotalUp: 100, NetTotalDown: 200},
+		{Time: (start.Add(time.Hour)), NetTotalUp: 130, NetTotalDown: 260},
 	}
 
 	resetAt, found := latestTrafficReset(records)

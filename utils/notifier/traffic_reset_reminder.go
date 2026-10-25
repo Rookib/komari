@@ -10,8 +10,8 @@ import (
 
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/config"
-	"github.com/komari-monitor/komari/pkg/corn"
+	"github.com/komari-monitor/komari/internal/config"
+	corn "github.com/komari-monitor/komari/internal/scheduler"
 	"github.com/komari-monitor/komari/utils/messageSender"
 	"github.com/komari-monitor/komari/utils/officialtraffic"
 	"gorm.io/gorm"
@@ -104,7 +104,7 @@ func claimTrafficResetReminder(db *gorm.DB, clientUUID, resetDate string, now ti
 	reminder := models.TrafficResetReminder{
 		Client:    clientUUID,
 		ResetDate: resetDate,
-		SentAt:    models.FromTime(now),
+		SentAt:    (now),
 	}
 	tx := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&reminder)
 	if tx.Error != nil {

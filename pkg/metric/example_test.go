@@ -20,7 +20,7 @@ func Example_rollupTags() {
 	store, err := metric.Open(ctx, metric.SQLite(
 		"file:metric-example?mode=memory&cache=shared",
 		metric.WithRollupPolicy(metric.RollupPolicy{
-			RawRetention: 2 * time.Minute,
+			RawRetention: 10 * time.Minute,
 			Tiers: []metric.RollupTier{
 				{Interval: time.Minute, Retention: 24 * time.Hour},
 			},
@@ -32,10 +32,10 @@ func Example_rollupTags() {
 	defer store.Close()
 
 	if err := store.CreateMetric(ctx, metric.Definition{
-		Name: "gpu.usage",
-		Type: metric.TypeGauge,
-		Unit: "%",
-	}); err != nil {
+		Name:          "gpu.usage",
+		Type:          metric.TypeGauge,
+		Unit:          "%",
+		RetentionDays: 30}); err != nil {
 		log.Fatal(err)
 	}
 
@@ -63,8 +63,8 @@ func Example_rollupTags() {
 		log.Fatal(err)
 	}
 
-	// Compact builds one rollup series per tag set. Raw points older than the
-	// policy's RawRetention are deleted after their rollups are materialized.
+	// Compact builds one rollup series per tag set. Exact raw points stay only
+	// in the Store's fixed ten-minute memory window.
 	now := base.Add(time.Hour)
 	if _, err := store.Compact(ctx, now); err != nil {
 		log.Fatal(err)
@@ -104,7 +104,7 @@ func Example_agentFleetLifecycle() {
 	store, err := metric.Open(ctx, metric.SQLite(
 		"file:metric-agent-fleet?mode=memory&cache=shared",
 		metric.WithRollupPolicy(metric.RollupPolicy{
-			RawRetention: 2 * time.Minute,
+			RawRetention: 10 * time.Minute,
 			Tiers: []metric.RollupTier{
 				{Interval: time.Minute, Retention: 24 * time.Hour},
 				{Interval: 5 * time.Minute, Retention: 30 * 24 * time.Hour},
@@ -117,15 +117,15 @@ func Example_agentFleetLifecycle() {
 	defer store.Close()
 
 	for _, def := range []metric.Definition{
-		{Name: "cpu.usage", Type: metric.TypeGauge, Unit: "%"},
-		{Name: "mem.usage", Type: metric.TypeGauge, Unit: "%"},
-		{Name: "disk.usage", Type: metric.TypeGauge, Unit: "%"},
-		{Name: "swap.usage", Type: metric.TypeGauge, Unit: "%"},
-		{Name: "net.in.bytes", Type: metric.TypeCounter, Unit: "bytes"},
-		{Name: "net.out.bytes", Type: metric.TypeCounter, Unit: "bytes"},
-		{Name: "process.count", Type: metric.TypeGauge, Unit: "count"},
-		{Name: "gpu.usage", Type: metric.TypeGauge, Unit: "%"},
-		{Name: "ping.latency_ms", Type: metric.TypeGauge, Unit: "ms"},
+		{Name: "cpu.usage", Type: metric.TypeGauge, Unit: "%", RetentionDays: 30},
+		{Name: "mem.usage", Type: metric.TypeGauge, Unit: "%", RetentionDays: 30},
+		{Name: "disk.usage", Type: metric.TypeGauge, Unit: "%", RetentionDays: 30},
+		{Name: "swap.usage", Type: metric.TypeGauge, Unit: "%", RetentionDays: 30},
+		{Name: "net.in.bytes", Type: metric.TypeCounter, Unit: "bytes", RetentionDays: 30},
+		{Name: "net.out.bytes", Type: metric.TypeCounter, Unit: "bytes", RetentionDays: 30},
+		{Name: "process.count", Type: metric.TypeGauge, Unit: "count", RetentionDays: 30},
+		{Name: "gpu.usage", Type: metric.TypeGauge, Unit: "%", RetentionDays: 30},
+		{Name: "ping.latency_ms", Type: metric.TypeGauge, Unit: "ms", RetentionDays: 30},
 	} {
 		if err := store.UpsertMetric(ctx, def); err != nil {
 			log.Fatal(err)
@@ -158,7 +158,7 @@ func Example_agentFleetLifecycle() {
 			}
 			if err := store.UpsertMetric(ctx, metric.Definition{
 				Name: "ping.latency_ms", Type: metric.TypeGauge, Unit: "ms",
-			}); err != nil {
+				RetentionDays: 30}); err != nil {
 				log.Fatal(err)
 			}
 		case 85:

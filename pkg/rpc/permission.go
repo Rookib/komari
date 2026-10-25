@@ -188,6 +188,12 @@ func CheckPermission(group, method string) bool {
 // 该模型使 agent 与 admin 成为正交主体:admin 不再自动获得 client 能力(反之亦然),
 // 从而堵住"admin 会话冒充 agent 调用 client:* 上报方法"等越权路径。
 func CheckPrincipal(p *Principal, method string) bool {
+	// A panel upgrade must not enable credential export or replace a reviewed
+	// TCP-safe agent with an unrestricted upstream binary. This policy is not
+	// configurable through ACL rules, API keys, or agent-reported capabilities.
+	if IsDisabledAgentControl(method) {
+		return false
+	}
 	if p == nil {
 		p = NewAnonymousPrincipal()
 	}

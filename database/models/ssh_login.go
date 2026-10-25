@@ -1,5 +1,7 @@
 package models
 
+import "time"
+
 import (
 	"net"
 	"strings"
@@ -48,7 +50,7 @@ type SSHLoginEvent struct {
 	RemoteIP    string    `json:"remote_ip" gorm:"type:varchar(100);index"`
 	RemotePort  int       `json:"remote_port" gorm:"type:int"`
 	AuthMethod  string    `json:"auth_method" gorm:"type:varchar(64)"`
-	OccurredAt  LocalTime `json:"occurred_at" gorm:"index"`
-	CreatedAt   LocalTime `json:"created_at"`
+	OccurredAt  time.Time `json:"occurred_at" gorm:"index"`
+	CreatedAt   time.Time `json:"created_at"`
 	Whitelisted bool      `json:"whitelisted" gorm:"type:boolean;default:false"`
 }

@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari/database/dbcore"
-	"github.com/komari-monitor/komari/database/metricstore"
 	"github.com/komari-monitor/komari/database/models"
 	messageevent "github.com/komari-monitor/komari/database/models/messageEvent"
-	"github.com/komari-monitor/komari/pkg/config"
-	"github.com/komari-monitor/komari/pkg/corn"
+	"github.com/komari-monitor/komari/internal/config"
+	"github.com/komari-monitor/komari/internal/metricstore"
+	corn "github.com/komari-monitor/komari/internal/scheduler"
 	"github.com/komari-monitor/komari/utils/messageSender"
 )
 
@@ -268,7 +268,7 @@ func GetLatestClientTrafficReset(clientUUID string, now time.Time) (time.Time, b
 }
 
 type trafficDeltaRecord struct {
-	Time         models.LocalTime
+	Time         time.Time
 	NetTotalUp   int64
 	NetTotalDown int64
 	TrafficUp    int64
@@ -277,7 +277,7 @@ type trafficDeltaRecord struct {
 
 func sortTrafficDeltaRecords(records []trafficDeltaRecord) {
 	sort.Slice(records, func(i, j int) bool {
-		return records[i].Time.ToTime().Before(records[j].Time.ToTime())
+		return records[i].Time.Before(records[j].Time)
 	})
 }
 
@@ -285,7 +285,7 @@ func latestTrafficReset(records []trafficDeltaRecord) (time.Time, bool) {
 	var latest time.Time
 	for index := 1; index < len(records); index++ {
 		if records[index].NetTotalUp < records[index-1].NetTotalUp || records[index].NetTotalDown < records[index-1].NetTotalDown {
-			latest = records[index].Time.ToTime()
+			latest = records[index].Time
 		}
 	}
 	return latest, !latest.IsZero()

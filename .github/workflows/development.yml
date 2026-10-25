@@ -14,18 +14,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      #- name: Create dummy index.html
-      #  run: |
-      #    mkdir -p web/public/defaultTheme/dist
-      #    echo "<html><body><h1>This is komari development server.</h1></body></html>" > web/public/defaultTheme/dist/index.html
-
       - name: Clone and build frontend
         uses: ./.github/actions/build-frontend
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"
 
       - name: Build application
         env:
@@ -33,7 +28,7 @@ jobs:
           GOARCH: amd64
         run: |
           VERSION_SHA="${{ github.sha }}"
-          go build -ldflags "-X github.com/komari-monitor/komari/utils.CurrentVersion=dev -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_SHA}" -o komari .
+          go build -ldflags "-s -w -extldflags=-Wl,--strip-all -X github.com/komari-monitor/komari/utils.CurrentVersion=dev -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_SHA}" -o komari .
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/corn"
+	"github.com/komari-monitor/komari/internal/scheduler"
 	v2 "github.com/komari-monitor/komari/protocol/v2"
 	agent_runtime "github.com/komari-monitor/komari/web/agent"
 )
@@ -27,7 +27,7 @@ func (m *PingTaskManager) Reload(pingTasks []models.PingTask) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	corn.RemovePrefix("ping:")
+	scheduler.RemovePrefix("ping:")
 	m.tasks = make(map[int][]models.PingTask)
 
 	// 按Interval分组任务
@@ -44,7 +44,7 @@ func (m *PingTaskManager) Reload(pingTasks []models.PingTask) error {
 		interval := interval
 		tasks := append([]models.PingTask(nil), tasks...)
 		m.tasks[interval] = tasks
-		if err := corn.AddContextFunc(fmt.Sprintf("ping:%d", interval), corn.Every(time.Duration(interval)*time.Second), false, func(ctx context.Context) {
+		if err := scheduler.AddContextFunc(fmt.Sprintf("ping:%d", interval), scheduler.Every(time.Duration(interval)*time.Second), false, func(ctx context.Context) {
 			for _, task := range tasks {
 				go executePingTask(ctx, task)
 			}
@@ -57,18 +57,6 @@ func (m *PingTaskManager) Reload(pingTasks []models.PingTask) error {
 
 // executePingTask 执行单个PingTask
 func executePingTask(ctx context.Context, task models.PingTask) {
-	var message struct {
-		TaskID  uint   `json:"ping_task_id"`
-		Message string `json:"message"`
-		Type    string `json:"ping_type"`
-		Target  string `json:"ping_target"`
-	}
-
-	message.Message = "ping"
-	message.TaskID = task.Id
-	message.Type = task.Type
-	message.Target = task.Target
-
 	for _, clientUUID := range targetPingClientUUIDs(task) {
 		select {
 		case <-ctx.Done():
@@ -78,7 +66,7 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 			// Context is still active, continue.
 		}
 
-		agent_runtime.DispatchPing(clientUUID, message, v2.PingParams{TaskID: task.Id, Type: task.Type, Target: task.Target})
+		agent_runtime.DispatchPing(clientUUID, v2.PingParams{TaskID: task.Id, Type: task.Type, Target: task.Target})
 	}
 }
 

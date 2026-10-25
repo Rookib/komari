@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// TestAggregateRollupExcludesPartialBucket verifies the rollup query no longer
-// drags an out-of-window sample in through a partially-overlapping bucket.
+// TestAggregateRollupIncludesPartialMinute verifies query boundaries use the
+// persisted minute as the smallest indivisible unit.
 //
 // Two samples share one 1m rollup bucket [00:00:00, 00:01:00): 00:00:10=100 and
 // 00:00:50=10. A query window of [00:00:40, 00:01:30] only overlaps part of that
@@ -19,11 +19,11 @@ import (
 //
 // TestAggregateRollupExcludesPartialBucket 验证 rollup 查询不再通过部分重叠的桶
 // 把窗口外的样本带进来。
-func TestAggregateRollupExcludesPartialBucket(t *testing.T) {
+func TestAggregateRollupIncludesPartialMinute(t *testing.T) {
 	ctx := context.Background()
 	policy := RollupPolicy{Tiers: []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}}}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "win", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "win", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -47,13 +47,8 @@ func TestAggregateRollupExcludesPartialBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("aggregate rollup: %v", err)
 	}
-	// The partially-overlapping bucket is excluded under full containment, so the
-	// out-of-window 00:00:10 sample (value 100) must not appear. Concretely: no
-	// returned bucket may carry the out-of-window value or a count of 2.
-	for _, p := range res {
-		if p.Count >= 2 || p.Value == 100 {
-			t.Fatalf("partial bucket leaked out-of-window sample: %#v", p)
-		}
+	if len(res) != 1 || res[0].Count != 2 || res[0].Value != 110 {
+		t.Fatalf("partial query should include the complete minute summary: %#v", res)
 	}
 }
 
@@ -72,7 +67,7 @@ func TestAggregateRollupEndBoundaryInclusive(t *testing.T) {
 	ctx := context.Background()
 	policy := RollupPolicy{Tiers: []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}}}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "edge", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "edge", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -123,7 +118,7 @@ func TestSeriesHybridMergesStraddlingBucket(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "straddle", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "straddle", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
@@ -140,16 +135,6 @@ func TestSeriesHybridMergesStraddlingBucket(t *testing.T) {
 	}
 	if _, err := s.Compact(ctx, now); err != nil {
 		t.Fatalf("compact: %v", err)
-	}
-
-	// Confirm the old raw point was deleted and the recent one survives, so the
-	// two halves genuinely come from different sources.
-	oldRaw, err := s.Query(ctx, Query{MetricName: "straddle", EntityID: "n1", Start: old.Add(-time.Minute), End: old.Add(time.Minute)})
-	if err != nil {
-		t.Fatalf("query old raw: %v", err)
-	}
-	if len(oldRaw) != 0 {
-		t.Fatalf("expected old raw point deleted by retention, got %d", len(oldRaw))
 	}
 
 	got, err := s.Series(ctx, AggregateQuery{
@@ -192,7 +177,7 @@ func TestSeriesHybridSumAcrossBoundary(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "sumstraddle", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "sumstraddle", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
@@ -236,7 +221,7 @@ func TestSeriesHybridIncludesRawBetweenCutoffAndNextBucket(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "cutgap", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "cutgap", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -273,12 +258,12 @@ func TestSeriesHybridEndAtCutoffIncludesRawBoundary(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "cutedge", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "cutedge", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
 	now := time.Date(2026, 6, 18, 12, 0, 30, 0, time.UTC)
-	cutoff := policy.rawCutoff(now)
+	cutoff := now.Add(-30 * time.Minute)
 	if err := s.Write(ctx, Point{MetricName: "cutedge", EntityID: "n1", Timestamp: cutoff, Value: 7}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -310,7 +295,7 @@ func TestCompactDoesNotDoubleCountRawBucketAfterCutoffAdvances(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "nodup", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "nodup", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -351,24 +336,22 @@ func TestSeriesHybridIncludesPartialCoarseBucketAtRawCutoff(t *testing.T) {
 	policy := RollupPolicy{
 		RawRetention: 10 * time.Minute,
 		Tiers: []RollupTier{
-			{Interval: time.Minute, Retention: 20 * time.Minute},
+			{Interval: time.Minute, Retention: 2 * time.Hour},
 			{Interval: time.Hour, Retention: 24 * time.Hour},
 		},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "coarse-cutoff", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "coarse-cutoff", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
 	now := time.Date(2026, 6, 18, 12, 50, 0, 0, time.UTC)
 	old := now.Add(-40 * time.Minute)
 	recent := now.Add(-5 * time.Minute)
-	if err := s.WriteBatch(ctx, []Point{
-		{MetricName: "coarse-cutoff", EntityID: "n1", Timestamp: old, Value: 10},
-		{MetricName: "coarse-cutoff", EntityID: "n1", Timestamp: recent, Value: 100},
-	}); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, now,
+		Point{MetricName: "coarse-cutoff", EntityID: "n1", Timestamp: old, Value: 10},
+		Point{MetricName: "coarse-cutoff", EntityID: "n1", Timestamp: recent, Value: 100},
+	)
 	if _, err := s.Compact(ctx, now); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -382,6 +365,69 @@ func TestSeriesHybridIncludesPartialCoarseBucketAtRawCutoff(t *testing.T) {
 		t.Fatalf("series: %v", err)
 	}
 	if len(got) != 1 || got[0].Count != 2 || math.Abs(got[0].Value-55) > 1e-9 {
-		t.Fatalf("expected coarse rollup and recent raw point, got %#v", got)
+		t.Fatalf("expected persisted and in-memory hourly data, got %#v", got)
+	}
+}
+
+func TestSeriesAndAggregateRollupBridgeSealedCoarseTail(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{Tiers: []RollupTier{
+		{Interval: time.Minute, Retention: 24 * time.Hour},
+		{Interval: 5 * time.Minute, Retention: 7 * 24 * time.Hour},
+	}, Compression: 30}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "sealed-tail", RetentionDays: 30}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+	write := func(now time.Time, points ...Point) {
+		t.Helper()
+		prepared, err := prepareMetricPoints(points)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rebuild := s.writeRawPointsAt(prepared, now)
+		if err := s.writePreparedHotRollups(ctx, prepared, now, rebuild); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(base.Add(6*time.Minute),
+		Point{MetricName: "sealed-tail", EntityID: "n1", Timestamp: base.Add(30 * time.Second), Value: 1},
+		Point{MetricName: "sealed-tail", EntityID: "n1", Timestamp: base.Add(4 * time.Minute), Value: 20},
+	)
+	write(base.Add(13*time.Minute), Point{MetricName: "sealed-tail", EntityID: "n1", Timestamp: base.Add(12 * time.Minute), Value: 50})
+	if written, err := s.FlushCoarse(ctx, base.Add(16*time.Minute)); err != nil || written != 1 {
+		t.Fatalf("seal first five-minute bucket = %d, %v; want 1, nil", written, err)
+	}
+	query := AggregateQuery{
+		Query:       Query{MetricName: "sealed-tail", EntityID: "n1", Start: base, End: base.Add(15*time.Minute - time.Millisecond)},
+		Aggregation: AggSum,
+		Interval:    15 * time.Minute,
+	}
+	for _, result := range []struct {
+		name string
+		read func() ([]AggregatePoint, error)
+	}{
+		{name: "series", read: func() ([]AggregatePoint, error) { return s.Series(ctx, query, base.Add(16*time.Minute)) }},
+		{name: "aggregate", read: func() ([]AggregatePoint, error) {
+			return s.aggregateRollupAt(ctx, query, 5*time.Minute, base.Add(16*time.Minute))
+		}},
+	} {
+		points, err := result.read()
+		if err != nil {
+			t.Fatalf("%s: %v", result.name, err)
+		}
+		if len(points) != 1 || points[0].Count != 3 || points[0].Value != 71 {
+			t.Fatalf("%s bridged values = %#v, want count=3 sum=71", result.name, points)
+		}
+	}
+	rateQuery := query
+	rateQuery.Aggregation = AggRate
+	rate, err := s.Series(ctx, rateQuery, base.Add(16*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rate) != 1 || math.Abs(rate[0].Value-0.0625) > 1e-9 {
+		t.Fatalf("bridged rate = %#v, want 0.0625", rate)
 	}
 }

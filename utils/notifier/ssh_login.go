@@ -83,8 +83,8 @@ func NotifySSHLogin(clientUUID string, params v2.SSHLoginParams) error {
 		RemoteIP:    params.RemoteIP,
 		RemotePort:  params.RemotePort,
 		AuthMethod:  params.AuthMethod,
-		OccurredAt:  models.FromTime(occurredAt),
-		CreatedAt:   models.Now(),
+		OccurredAt:  (occurredAt),
+		CreatedAt:   time.Now().UTC(),
 		Whitelisted: whitelisted,
 	}); err != nil {
 		return err

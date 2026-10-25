@@ -3,7 +3,7 @@ package jsonrpc
 import (
 	"context"
 
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/pkg/rpc"
 )
 
@@ -34,9 +34,8 @@ func Dispatch(ctx context.Context, meta *rpc.ContextMeta, req *rpc.JsonRpcReques
 			meta.Principal = rpc.NewAnonymousPrincipal()
 		}
 	}
-	if meta.Permission == "" {
-		meta.Permission = meta.Principal.PrimaryRole()
-	}
+	// Principal is authoritative, including for handlers that still read Permission.
+	meta.Permission = meta.Principal.PrimaryRole()
 
 	// 私有站点：未认证访客一律拒绝，但放行登录页所需的元信息接口(见 issue #567)。
 	// 持有有效临时分享许可(temp_key)的匿名访客同样放行，使「临时分析」分享链接在私有站点下可用；

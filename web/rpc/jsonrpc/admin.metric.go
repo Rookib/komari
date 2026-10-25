@@ -3,20 +3,22 @@ package jsonrpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
+	"time"
 
 	"github.com/komari-monitor/komari/database/auditlog"
-	"github.com/komari-monitor/komari/database/metricstore"
+	"github.com/komari-monitor/komari/internal/metricstore"
+	"github.com/komari-monitor/komari/pkg/metric"
 	"github.com/komari-monitor/komari/pkg/rpc"
 )
 
 // admin.metric.go
 // Metrics 数据库迁移相关 RPC 方法（admin 命名空间）。
 //
-// 语义变更：过去这些方法用于把旧 komari.db 的 records/ping 表迁移到 metric store。
-// 现在“旧表 → metrics”已改为进程启动时自动一次性完成（见 metricstore.RunStartupMigration），
-// 无需 WebUI 介入。因此这些方法现在服务于「metrics 存储后端迁移」——即把默认
-// SQLite（./data/metrics.db）中的历史数据搬运到管理员新配置的 MySQL/PostgreSQL。
+// 这些方法服务于「metrics 存储后端迁移」：把默认 SQLite（./data/metrics.db）中的
+// 历史数据搬运到管理员新配置的 MySQL/PostgreSQL。此操作只会由管理员显式触发，
+// 服务启动不会自动迁移数据。
 //
 // 典型使用顺序（WebUI）：
 //  1. admin:editSettings 修改 metric_db_dsn 为 MySQL/PostgreSQL（后端会做连接测试
@@ -40,8 +42,8 @@ type metricDefinitionResponse struct {
 	Unit          string            `json:"unit,omitempty"`
 	RetentionDays int               `json:"retention_days"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
-	CreatedAt     any               `json:"created_at,omitempty"`
-	UpdatedAt     any               `json:"updated_at,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
 }
 
 func metricDescriptionValue(raw string) any {
@@ -93,29 +95,27 @@ func adminUpdateMetricDefinition(ctx context.Context, req *rpc.JsonRpcRequest) (
 	if params.Name == "" {
 		return nil, rpc.MakeError(rpc.InvalidParams, "name is required", nil)
 	}
-	if params.RetentionDays <= 0 {
-		return nil, rpc.MakeError(rpc.InvalidParams, "retention_days must be a positive integer", nil)
+	if params.RetentionDays < 0 {
+		return nil, rpc.MakeError(rpc.InvalidParams, "retention_days must be a non-negative integer", nil)
 	}
 	store := metricstore.GetStore()
 	if store == nil {
 		return nil, rpc.MakeError(rpc.InternalError, "metric store not initialized", nil)
 	}
-	def, err := store.GetMetric(ctx, params.Name)
-	if err != nil {
+	def, err := store.UpdateMetricRetention(ctx, params.Name, params.RetentionDays)
+	if errors.Is(err, metric.ErrNotFound) {
 		return nil, rpc.MakeError(rpc.InvalidParams, "metric not found: "+params.Name, nil)
 	}
-	def.RetentionDays = params.RetentionDays
-	if err := store.UpsertMetric(ctx, def); err != nil {
+	if err != nil {
 		return nil, rpc.MakeError(rpc.InternalError, "Failed to update metric definition: "+err.Error(), nil)
+	}
+	if params.RetentionDays == 0 {
+		metricstore.DeleteMetricDataAsync(params.Name)
 	}
 
 	actor, ip := auditActor(ctx)
 	auditlog.Log(ip, actor, "update metric definition: "+params.Name, "info")
 
-	def, err = store.GetMetric(ctx, params.Name)
-	if err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, "Failed to reload metric definition: "+err.Error(), nil)
-	}
 	return metricDefinitionResponse{
 		Name:          def.Name,
 		Description:   metricDescriptionValue(def.Description),

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -25,6 +26,62 @@ func newRollupStore(t *testing.T, policy RollupPolicy) *Store {
 	return store
 }
 
+func writeRollupPointsAt(t *testing.T, ctx context.Context, s *Store, now time.Time, points ...Point) {
+	t.Helper()
+	prepared, err := prepareMetricPoints(points)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuild := s.writeRawPointsAt(prepared, now)
+	if err := s.writePreparedHotRollups(ctx, prepared, now, rebuild); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLatestBeforeUsesRawAndRollupData(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{
+		RawRetention: 15 * time.Minute,
+		Tiers: []RollupTier{
+			{Interval: time.Minute, Retention: 24 * time.Hour},
+		},
+	}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "counter", Type: TypeCounter, RetentionDays: 1}); err != nil {
+		t.Fatalf("create metric: %v", err)
+	}
+	base := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if err := s.WriteBatch(ctx, []Point{
+		{MetricName: "counter", EntityID: "node", Timestamp: base, Value: 10},
+		{MetricName: "counter", EntityID: "node", Timestamp: base.Add(5 * time.Minute), Value: 20},
+	}); err != nil {
+		t.Fatalf("write old counters: %v", err)
+	}
+	if _, err := s.Compact(ctx, base.Add(30*time.Minute)); err != nil {
+		t.Fatalf("compact counters: %v", err)
+	}
+
+	point, ok, err := s.LatestBefore(ctx, "counter", "node", base.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("latest rollup before boundary: %v", err)
+	}
+	if !ok || point.Value != 10 || !point.Timestamp.Equal(base) {
+		t.Fatalf("unexpected bounded rollup point: %#v, found=%v", point, ok)
+	}
+
+	recent := base.Add(29 * time.Minute)
+	if err := s.Write(ctx, Point{MetricName: "counter", EntityID: "node", Timestamp: recent, Value: 30}); err != nil {
+		t.Fatalf("write recent counter: %v", err)
+	}
+	point, ok, err = s.LatestBefore(ctx, "counter", "node", base.Add(30*time.Minute))
+	if err != nil {
+		t.Fatalf("latest raw before boundary: %v", err)
+	}
+	if !ok || point.Value != 30 || !point.Timestamp.Equal(recent) {
+		t.Fatalf("unexpected latest raw point: %#v, found=%v", point, ok)
+	}
+}
+
 // TestArbitraryPercentileOverRaw verifies arbitrary percentile (pxx)
 // aggregation end-to-end over raw points.
 //
@@ -33,17 +90,15 @@ func newRollupStore(t *testing.T, policy RollupPolicy) *Store {
 func TestArbitraryPercentileOverRaw(t *testing.T) {
 	ctx := context.Background()
 	s := newMemStore(t)
-	if err := s.CreateMetric(ctx, Definition{Name: "lat", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "lat", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
+	base := time.Now().UTC().Truncate(time.Minute).Add(-time.Minute)
 	var batch []Point
 	for i := 1; i <= 100; i++ { // values 1..100 in one bucket
-		batch = append(batch, Point{MetricName: "lat", EntityID: "n1", Timestamp: base.Add(time.Duration(i) * time.Second), Value: float64(i)})
+		batch = append(batch, Point{MetricName: "lat", EntityID: "n1", Timestamp: base.Add(time.Duration(i) * 500 * time.Millisecond), Value: float64(i)})
 	}
-	if err := s.WriteBatch(ctx, batch); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, base.Add(5*time.Minute), batch...)
 	for _, tc := range []struct {
 		agg  Aggregation
 		want float64
@@ -55,9 +110,9 @@ func TestArbitraryPercentileOverRaw(t *testing.T) {
 		{Pxx(75), percentileSortedRange(1, 100, 0.75)},
 	} {
 		res, err := s.Aggregate(ctx, AggregateQuery{
-			Query:       Query{MetricName: "lat", EntityID: "n1", Start: base, End: base.Add(time.Hour)},
+			Query:       Query{MetricName: "lat", EntityID: "n1", Start: base, End: base.Add(time.Minute)},
 			Aggregation: tc.agg,
-			Interval:    time.Hour,
+			Interval:    time.Minute,
 		})
 		if err != nil {
 			t.Fatalf("aggregate %s: %v", tc.agg, err)
@@ -65,9 +120,49 @@ func TestArbitraryPercentileOverRaw(t *testing.T) {
 		if len(res) != 1 {
 			t.Fatalf("%s: expected 1 bucket, got %d", tc.agg, len(res))
 		}
-		if math.Abs(res[0].Value-tc.want) > 1e-9 {
+		if math.Abs(res[0].Value-tc.want) > math.Max(0.5, math.Abs(tc.want)*0.05) {
 			t.Fatalf("%s: got %v want %v", tc.agg, res[0].Value, tc.want)
 		}
+	}
+}
+
+func TestAggregateRollupSkipsDigestForNonPercentile(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{
+		RawRetention: 2 * time.Minute,
+		Tiers: []RollupTier{
+			{Interval: time.Minute, Retention: time.Hour},
+		},
+	}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "latency", Type: TypeGauge, RetentionDays: 1}); err != nil {
+		t.Fatalf("create metric: %v", err)
+	}
+
+	base := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	if err := s.WriteBatch(ctx, []Point{
+		{MetricName: "latency", EntityID: "node", Timestamp: base.Add(10 * time.Second), Value: 10},
+		{MetricName: "latency", EntityID: "node", Timestamp: base.Add(20 * time.Second), Value: 20},
+	}); err != nil {
+		t.Fatalf("write points: %v", err)
+	}
+	if _, err := s.Compact(ctx, base.Add(4*time.Minute)); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET digest = ?", s.tables.rollups), []byte("invalid")); err != nil {
+		t.Fatalf("corrupt digest: %v", err)
+	}
+
+	query := Query{MetricName: "latency", EntityID: "node", Start: base, End: base.Add(time.Minute)}
+	avg, err := s.AggregateRollup(ctx, AggregateQuery{Query: query, Aggregation: AggAvg, Interval: time.Minute}, time.Minute)
+	if err != nil {
+		t.Fatalf("average should not read digest: %v", err)
+	}
+	if len(avg) != 1 || avg[0].Value != 15 {
+		t.Fatalf("average = %#v, want one bucket with value 15", avg)
+	}
+	if _, err := s.AggregateRollup(ctx, AggregateQuery{Query: query, Aggregation: Pxx(4), Interval: time.Minute}, time.Minute); err == nil {
+		t.Fatal("percentile query should reject an invalid digest")
 	}
 }
 
@@ -113,7 +208,7 @@ func TestCompactBuildsFinestTier(t *testing.T) {
 		Tiers: []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "m", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "m", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -122,16 +217,14 @@ func TestCompactBuildsFinestTier(t *testing.T) {
 	for i := 0; i < 120; i++ {
 		batch = append(batch, Point{MetricName: "m", EntityID: "n1", Timestamp: base.Add(time.Duration(i) * time.Second), Value: float64(i)})
 	}
-	if err := s.WriteBatch(ctx, batch); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, base.Add(5*time.Minute), batch...)
 	now := base.Add(10 * time.Minute)
 	written, err := s.Compact(ctx, now)
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	if written != 2 {
-		t.Fatalf("expected 2 rollup buckets written, got %d", written)
+	if written != 0 {
+		t.Fatalf("compact unexpectedly rewrote %d rollup buckets", written)
 	}
 	// AggregateRollup at the 1m resolution should reproduce per-bucket stats.
 	res, err := s.AggregateRollup(ctx, AggregateQuery{
@@ -189,7 +282,7 @@ func TestCompactCascadeFineToCoarse(t *testing.T) {
 		},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "c", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "c", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -198,9 +291,7 @@ func TestCompactCascadeFineToCoarse(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		batch = append(batch, Point{MetricName: "c", EntityID: "n1", Timestamp: base.Add(time.Duration(i) * time.Second), Value: float64(i)})
 	}
-	if err := s.WriteBatch(ctx, batch); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, base.Add(5*time.Minute), batch...)
 	if _, err := s.Compact(ctx, base.Add(time.Hour)); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -244,7 +335,7 @@ func TestCompactDoesNotOverwriteCoarseRollupWithPartialFineRows(t *testing.T) {
 		},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "partial", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "partial", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -252,9 +343,7 @@ func TestCompactDoesNotOverwriteCoarseRollupWithPartialFineRows(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		batch = append(batch, Point{MetricName: "partial", EntityID: "n1", Timestamp: base.Add(time.Duration(i) * time.Second), Value: 1})
 	}
-	if err := s.WriteBatch(ctx, batch); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, base.Add(5*time.Minute), batch...)
 	if _, err := s.Compact(ctx, base.Add(15*time.Minute)); err != nil {
 		t.Fatalf("compact initial: %v", err)
 	}
@@ -290,8 +379,8 @@ func TestCompactDoesNotOverwriteCoarseRollupWithPartialFineRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollup after late: %v", err)
 	}
-	if len(late) != 1 || late[0].Count != 301 {
-		t.Fatalf("late fine delta should merge into retained coarse bucket: %#v", late)
+	if len(late) != 1 || late[0].Count != 300 {
+		t.Fatalf("sealed coarse bucket was rewritten by a late minute: %#v", late)
 	}
 	if _, err := s.Compact(ctx, base.Add(20*time.Minute)); err != nil {
 		t.Fatalf("compact late again: %v", err)
@@ -300,8 +389,8 @@ func TestCompactDoesNotOverwriteCoarseRollupWithPartialFineRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollup after repeated compact: %v", err)
 	}
-	if len(again) != 1 || again[0].Count != 301 {
-		t.Fatalf("repeated compact should not merge the same late delta twice: %#v", again)
+	if len(again) != 1 || again[0].Count != 300 {
+		t.Fatalf("repeated compact rewrote sealed coarse bucket: %#v", again)
 	}
 }
 
@@ -315,13 +404,11 @@ func TestCompactMergesLateFineDeltaLargerThanCoarseBucket(t *testing.T) {
 		},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "latebig", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "latebig", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
-	if err := s.Write(ctx, Point{MetricName: "latebig", EntityID: "n1", Timestamp: base.Add(10 * time.Second), Value: 1}); err != nil {
-		t.Fatalf("write original: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, base.Add(time.Minute), Point{MetricName: "latebig", EntityID: "n1", Timestamp: base.Add(10 * time.Second), Value: 1})
 	if _, err := s.Compact(ctx, base.Add(15*time.Minute)); err != nil {
 		t.Fatalf("compact initial: %v", err)
 	}
@@ -344,8 +431,8 @@ func TestCompactMergesLateFineDeltaLargerThanCoarseBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollup: %v", err)
 	}
-	if len(got) != 1 || got[0].Count != 3 {
-		t.Fatalf("late delta should merge even when larger than existing bucket, got %#v", got)
+	if len(got) != 1 || got[0].Count != 1 {
+		t.Fatalf("late data rewrote the sealed coarse bucket: %#v", got)
 	}
 }
 
@@ -361,7 +448,7 @@ func TestRetentionDropsRawButPercentileSurvives(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 365 * 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "old", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "old", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -376,14 +463,6 @@ func TestRetentionDropsRawButPercentileSurvives(t *testing.T) {
 	now := base.Add(48 * time.Hour)
 	if _, err := s.Compact(ctx, now); err != nil {
 		t.Fatalf("compact: %v", err)
-	}
-	// Raw must be gone.
-	raw, err := s.Query(ctx, Query{MetricName: "old", EntityID: "n1", Start: base, End: base.Add(time.Hour)})
-	if err != nil {
-		t.Fatalf("query raw: %v", err)
-	}
-	if len(raw) != 0 {
-		t.Fatalf("expected raw points deleted by retention, got %d", len(raw))
 	}
 	// Percentile must still be answerable from the surviving rollup.
 	res, err := s.AggregateRollup(ctx, AggregateQuery{
@@ -403,6 +482,70 @@ func TestRetentionDropsRawButPercentileSurvives(t *testing.T) {
 	}
 }
 
+func TestRollupOmitsAndReconstructsConstantDigests(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{
+		RawRetention: 2 * time.Minute,
+		Tiers: []RollupTier{
+			{Interval: time.Minute, Retention: 365 * 24 * time.Hour},
+			{Interval: 5 * time.Minute, Retention: 365 * 24 * time.Hour},
+		},
+	}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "small", Type: TypeGauge, RetentionDays: 1}); err != nil {
+		t.Fatalf("create metric: %v", err)
+	}
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.WriteBatch(ctx, []Point{
+		{MetricName: "small", EntityID: "n1", Timestamp: base, Value: 10},
+		{MetricName: "small", EntityID: "n1", Timestamp: base.Add(time.Minute), Value: 20},
+		{MetricName: "small", EntityID: "n1", Timestamp: base.Add(time.Minute + time.Second), Value: 20},
+	}); err != nil {
+		t.Fatalf("write points: %v", err)
+	}
+	if _, err := s.Compact(ctx, base.Add(2*time.Hour)); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	var smallDigests int
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COUNT(*) FROM %s r JOIN %s s ON s.id = r.series_id JOIN %s d ON d.id = r.resolution_id WHERE s.metric_name = ? AND d.resolution_milli = ? AND r.digest IS NULL`,
+		s.tables.rollups, s.tables.series, s.tables.resolutions,
+	), "small", time.Minute.Milliseconds()).Scan(&smallDigests); err != nil {
+		t.Fatalf("count omitted digests: %v", err)
+	}
+	if smallDigests != 2 {
+		t.Fatalf("omitted constant digests = %d, want 2", smallDigests)
+	}
+
+	minute, err := s.AggregateRollup(ctx, AggregateQuery{
+		Query:       Query{MetricName: "small", EntityID: "n1", Start: base, End: base.Add(2 * time.Minute)},
+		Aggregation: AggP95,
+		Interval:    time.Minute,
+	}, time.Minute)
+	if err != nil {
+		t.Fatalf("query minute percentile: %v", err)
+	}
+	if len(minute) != 2 || minute[0].Value != 10 || minute[1].Value != 20 {
+		t.Fatalf("minute percentiles = %#v, want [10 20]", minute)
+	}
+
+	one, err := digestFromRollup(1, 10, 10, nil, policy.Compression)
+	if err != nil {
+		t.Fatalf("reconstruct one-sample digest: %v", err)
+	}
+	two, err := digestFromRollup(2, 20, 20, nil, policy.Compression)
+	if err != nil {
+		t.Fatalf("reconstruct two-sample digest: %v", err)
+	}
+	merged := NewTDigest(policy.Compression)
+	merged.Merge(one)
+	merged.Merge(two)
+	if merged.Count() != 3 || merged.Quantile(0.95) < 19 || merged.Quantile(0.95) > 20 {
+		t.Fatalf("merged digest=%v, want 3 samples with p95 approximately 20", merged)
+	}
+}
+
 // TestCompactMergesLateRawIntoExpiredRollup verifies a late-arriving raw point
 // for an already-retained rollup bucket is folded into the stored rollup instead
 // of replacing the bucket with only the late sample.
@@ -416,7 +559,7 @@ func TestCompactMergesLateRawIntoExpiredRollup(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "late", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "late", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -474,7 +617,7 @@ func TestCompatibleSeriesIntervalUsesTierCoveringWindow(t *testing.T) {
 		interval time.Duration
 		want     time.Duration
 	}{
-		{name: "recent raw", start: now.Add(-5 * time.Minute), interval: 5 * time.Second, want: 5 * time.Second},
+		{name: "recent minute", start: now.Add(-5 * time.Minute), interval: 5 * time.Second, want: time.Minute},
 		{name: "one minute tier", start: now.Add(-24 * time.Hour), interval: 2 * time.Minute, want: 2 * time.Minute},
 		{name: "five minute tier", start: now.Add(-7 * 24 * time.Hour), interval: 10 * time.Minute, want: 10 * time.Minute},
 		{name: "five minute retention boundary", start: now.Add(-14 * 24 * time.Hour), interval: 30 * time.Minute, want: 30 * time.Minute},
@@ -510,9 +653,7 @@ func TestSeriesStartBeforeLongestRetentionReturnsAvailableRollup(t *testing.T) {
 
 	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
 	pointTime := now.Add(-80 * 24 * time.Hour).Add(15 * time.Minute)
-	if err := s.Write(ctx, Point{MetricName: "long-window", EntityID: "n1", Timestamp: pointTime, Value: 42}); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, pointTime.Add(time.Minute), Point{MetricName: "long-window", EntityID: "n1", Timestamp: pointTime, Value: 42})
 	if _, err := s.Compact(ctx, now); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -535,23 +676,20 @@ func TestSeriesStartBeforeLongestRetentionReturnsAvailableRollup(t *testing.T) {
 	}
 }
 
-// TestSeriesRoutesByAge verifies Series auto-routes between raw and rollup data
-// based on the query window's age.
-//
-// TestSeriesRoutesByAge 验证 Series 会根据查询窗口的新旧程度在原始数据和
-// rollup 数据之间自动路由。
-func TestSeriesRoutesByAge(t *testing.T) {
+// TestSeriesUsesRollupsAcrossAges verifies public history always uses the
+// persisted rollup ladder while exact raw samples remain a separate API.
+func TestSeriesUsesRollupsAcrossAges(t *testing.T) {
 	ctx := context.Background()
 	policy := RollupPolicy{
-		RawRetention: time.Hour,
+		RawRetention: time.Minute,
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 30 * 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "sr", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "sr", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
-	// Recent window (10 min ago) stays raw; old window (2 days ago) uses rollup.
+	// Both a recent historical window and an old window are served by rollups.
 	recent := now.Add(-10 * time.Minute)
 	old := now.Add(-48 * time.Hour)
 	var batch []Point
@@ -566,7 +704,6 @@ func TestSeriesRoutesByAge(t *testing.T) {
 		t.Fatalf("compact: %v", err)
 	}
 
-	// Recent window: Series should match raw Aggregate exactly (full fidelity).
 	recentQ := AggregateQuery{
 		Query:       Query{MetricName: "sr", EntityID: "n1", Start: recent.Add(-time.Minute), End: recent.Add(2 * time.Minute)},
 		Aggregation: AggAvg, Interval: time.Minute,
@@ -575,27 +712,24 @@ func TestSeriesRoutesByAge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("series recent: %v", err)
 	}
-	want, err := s.Aggregate(ctx, recentQ)
+	raw, err := s.Query(ctx, recentQ.Query)
 	if err != nil {
-		t.Fatalf("aggregate recent: %v", err)
+		t.Fatalf("query exact recent: %v", err)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("recent: series=%d raw=%d buckets", len(got), len(want))
+	if len(raw) != 0 {
+		t.Fatalf("historical exact raw samples were retained: %#v", raw)
 	}
-	for i := range got {
-		if !got[i].Bucket.Equal(want[i].Bucket) || got[i].Value != want[i].Value {
-			t.Fatalf("recent bucket %d differs: series=%#v raw=%#v", i, got[i], want[i])
+	var recentFound bool
+	for _, point := range got {
+		if point.Count == 60 && math.Abs(point.Value-29.5) < 1e-9 {
+			recentFound = true
 		}
 	}
+	if !recentFound {
+		t.Fatalf("recent window not served from rollup correctly: %#v", got)
+	}
 
-	// Old window: raw is gone, so Series must answer from the rollup tier.
-	oldRaw, err := s.Query(ctx, Query{MetricName: "sr", EntityID: "n1", Start: old, End: old.Add(time.Hour)})
-	if err != nil {
-		t.Fatalf("query old raw: %v", err)
-	}
-	if len(oldRaw) != 0 {
-		t.Fatalf("expected old raw aged out, got %d", len(oldRaw))
-	}
+	// Old windows use the same retained rollup summaries.
 	oldQ := AggregateQuery{
 		Query:       Query{MetricName: "sr", EntityID: "n1", Start: old.Add(-time.Minute), End: old.Add(2 * time.Minute)},
 		Aggregation: AggAvg, Interval: time.Minute,
@@ -628,7 +762,7 @@ func TestSeriesAcrossRetentionIncludesUncompactedRecentRaw(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "hybrid", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "hybrid", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
@@ -695,11 +829,178 @@ func TestRollupPolicyValidate(t *testing.T) {
 		{Tiers: []RollupTier{{Interval: time.Minute, Retention: 0}}},                                                                // zero retention
 		{Tiers: []RollupTier{{Interval: time.Minute, Retention: time.Hour}, {Interval: 90 * time.Second, Retention: time.Hour}}},    // not a multiple
 		{Tiers: []RollupTier{{Interval: time.Minute, Retention: 2 * time.Hour}, {Interval: 5 * time.Minute, Retention: time.Hour}}}, // coarse retention < fine
-		{RawRetention: 30 * time.Second, Tiers: []RollupTier{{Interval: time.Minute, Retention: time.Hour}}},                        // raw retention < 2x finest
 	}
 	for i, p := range bad {
 		if err := p.Validate(); !errors.Is(err, ErrInvalidArgument) {
 			t.Fatalf("bad policy %d should be invalid, got %v", i, err)
+		}
+	}
+}
+
+func TestRollupPolicyWithMetricRetentionPrunesRedundantTiers(t *testing.T) {
+	policy := RollupPolicy{
+		RawRetention: 15 * time.Minute,
+		Tiers: []RollupTier{
+			{Interval: time.Minute, Retention: 48 * time.Hour},
+			{Interval: 5 * time.Minute, Retention: 14 * 24 * time.Hour},
+			{Interval: time.Hour, Retention: 14 * 24 * time.Hour},
+		},
+		Compression: 30,
+	}
+	tests := []struct {
+		name      string
+		retention time.Duration
+		want      []RollupTier
+	}{
+		{
+			name:      "one day keeps finest tier",
+			retention: 24 * time.Hour,
+			want: []RollupTier{
+				{Interval: time.Minute, Retention: 24 * time.Hour},
+			},
+		},
+		{
+			name:      "seven days keeps minute and five minute tiers",
+			retention: 7 * 24 * time.Hour,
+			want: []RollupTier{
+				{Interval: time.Minute, Retention: 48 * time.Hour},
+				{Interval: 5 * time.Minute, Retention: 7 * 24 * time.Hour},
+			},
+		},
+		{
+			name:      "thirty days keeps all tiers",
+			retention: 30 * 24 * time.Hour,
+			want: []RollupTier{
+				{Interval: time.Minute, Retention: 48 * time.Hour},
+				{Interval: 5 * time.Minute, Retention: 14 * 24 * time.Hour},
+				{Interval: time.Hour, Retention: 30 * 24 * time.Hour},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := policy.withMetricRetention(test.retention)
+			if !reflect.DeepEqual(got.Tiers, test.want) {
+				t.Fatalf("tiers = %#v, want %#v", got.Tiers, test.want)
+			}
+			if got.Compression != 30 {
+				t.Fatalf("compression = %v, want 30", got.Compression)
+			}
+		})
+	}
+	if len(policy.Tiers) != 3 || policy.Tiers[2].Retention != 14*24*time.Hour {
+		t.Fatalf("withMetricRetention mutated source policy: %#v", policy.Tiers)
+	}
+}
+
+func TestCompactRemovesRollupsFromRedundantTiers(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{
+		RawRetention: 15 * time.Minute,
+		Tiers: []RollupTier{
+			{Interval: time.Minute, Retention: 48 * time.Hour},
+			{Interval: 5 * time.Minute, Retention: 14 * 24 * time.Hour},
+			{Interval: time.Hour, Retention: 14 * 24 * time.Hour},
+		},
+	}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "daily", Type: TypeGauge, RetentionDays: 1}); err != nil {
+		t.Fatalf("create metric: %v", err)
+	}
+
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	bucketTime := now.Add(-2 * time.Hour)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin seed transaction: %v", err)
+	}
+	for _, interval := range []time.Duration{time.Minute, 5 * time.Minute, time.Hour} {
+		bucket := newRollupBucket(policy.compression())
+		bucket.addPoint(42, bucketTime.UnixNano())
+		key := rollupKey{entityID: "node", bucket: bucketTime.UnixNano()}
+		if _, err := s.writeRollupBucketsTx(ctx, "daily", interval, map[rollupKey]*rollupBucket{key: bucket}, tx); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("seed %s rollup: %v", interval, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit seed transaction: %v", err)
+	}
+
+	if _, err := s.CompactMetric(ctx, "daily", now); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	for _, test := range []struct {
+		interval time.Duration
+		want     int
+	}{
+		{interval: time.Minute, want: 1},
+		{interval: 5 * time.Minute, want: 0},
+		{interval: time.Hour, want: 0},
+	} {
+		rows, err := s.scanRollupRows(ctx, s.reader(), "daily", test.interval)
+		if err != nil {
+			t.Fatalf("scan %s rollups: %v", test.interval, err)
+		}
+		if len(rows) != test.want {
+			t.Fatalf("%s rollup rows = %d, want %d", test.interval, len(rows), test.want)
+		}
+	}
+}
+
+func TestCleanupExpiredRemovesExpiredAndInvalidTiers(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{Tiers: []RollupTier{
+		{Interval: time.Minute, Retention: 24 * time.Hour},
+		{Interval: 5 * time.Minute, Retention: 7 * 24 * time.Hour},
+		{Interval: time.Hour, Retention: 30 * 24 * time.Hour},
+		{Interval: 24 * time.Hour, Retention: 365 * 24 * time.Hour},
+	}, Compression: 30}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "cleanup-tier", RetentionDays: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	tagsHash, tagsJSON, err := tagsFingerprint(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tier := range policy.Tiers {
+		buckets := make(map[rollupKey]*rollupBucket)
+		for _, at := range []time.Time{now.Add(-48 * time.Hour), now.Add(-time.Hour)} {
+			bucket := newRollupBucket(policy.compression())
+			bucket.tagsHash, bucket.tagsJSON = tagsHash, tagsJSON
+			bucket.labelsHash, bucket.labelsJSON = emptyLabelsHash, "{}"
+			bucket.addPoint(1, at.UnixMilli())
+			key := rollupKey{entityID: "n1", tagsHash: tagsHash, labelsHash: emptyLabelsHash, bucket: bucketStartMillis(at.UnixMilli(), tier.Interval.Milliseconds())}
+			buckets[key] = bucket
+		}
+		if _, err := s.writeRollupBucketsTx(ctx, "cleanup-tier", tier.Interval, buckets, tx); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CleanupExpired(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, tier := range policy.Tiers {
+		rows, err := s.scanRollupRows(ctx, s.reader(), "cleanup-tier", tier.Interval)
+		if err != nil {
+			t.Fatalf("scan %s: %v", tier.Interval, err)
+		}
+		want := 0
+		if tier.Interval == time.Minute {
+			want = 1
+		}
+		if len(rows) != want {
+			t.Fatalf("%s rows after cleanup = %d, want %d", tier.Interval, len(rows), want)
 		}
 	}
 }
@@ -711,7 +1012,7 @@ func TestCompactIdempotent(t *testing.T) {
 	ctx := context.Background()
 	policy := RollupPolicy{Tiers: []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}}}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "idem", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "idem", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
@@ -763,21 +1064,19 @@ func TestCompactWithRawRetentionOnlyWritesChangedBuckets(t *testing.T) {
 		},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "incremental", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "incremental", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	base := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
-	if err := s.Write(ctx, Point{MetricName: "incremental", EntityID: "n1", Timestamp: base.Add(10 * time.Second), Value: 1}); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeRollupPointsAt(t, ctx, s, base.Add(time.Minute), Point{MetricName: "incremental", EntityID: "n1", Timestamp: base.Add(10 * time.Second), Value: 1})
 
 	now := base.Add(10 * time.Minute)
 	first, err := s.Compact(ctx, now)
 	if err != nil {
 		t.Fatalf("compact first: %v", err)
 	}
-	if first != 2 {
-		t.Fatalf("first compact wrote %d buckets, want 2", first)
+	if first != 0 {
+		t.Fatalf("first compact rewrote %d buckets, want 0", first)
 	}
 	second, err := s.Compact(ctx, now.Add(time.Minute))
 	if err != nil {
@@ -794,19 +1093,19 @@ func TestCompactWithRawRetentionOnlyWritesChangedBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compact late: %v", err)
 	}
-	if late != 2 {
-		t.Fatalf("late compact wrote %d buckets, want 2", late)
+	if late != 0 {
+		t.Fatalf("late compact rewrote %d buckets, want 0", late)
 	}
-	got, err := s.AggregateRollup(ctx, AggregateQuery{
+	got, err := s.aggregateRollupAt(ctx, AggregateQuery{
 		Query:       Query{MetricName: "incremental", EntityID: "n1", Start: base, End: base.Add(5*time.Minute - time.Nanosecond)},
 		Aggregation: AggSum,
 		Interval:    5 * time.Minute,
-	}, 5*time.Minute)
+	}, 5*time.Minute, now.Add(2*time.Minute))
 	if err != nil {
 		t.Fatalf("rollup: %v", err)
 	}
-	if len(got) != 1 || got[0].Count != 2 || got[0].Value != 3 {
-		t.Fatalf("late delta was not merged exactly once: %#v", got)
+	if len(got) != 1 || got[0].Count != 1 || got[0].Value != 1 {
+		t.Fatalf("explicit 5m query read a finer tier: %#v", got)
 	}
 }
 
@@ -824,7 +1123,7 @@ func TestCompactHonorsMetricRetentionForCoarsestTier(t *testing.T) {
 	if err := s.CreateMetric(ctx, Definition{Name: "retained", Type: TypeGauge, RetentionDays: 60}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := s.CreateMetric(ctx, Definition{Name: "longer-retained", Type: TypeGauge, RetentionDays: 90}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "longer-retained", Type: TypeGauge, RetentionDays: 120}); err != nil {
 		t.Fatalf("create longer metric: %v", err)
 	}
 	now := time.Date(2026, 7, 12, 12, 30, 0, 0, time.UTC)
@@ -832,10 +1131,10 @@ func TestCompactHonorsMetricRetentionForCoarsestTier(t *testing.T) {
 		{MetricName: "retained", EntityID: "n1", Timestamp: now.Add(-70 * 24 * time.Hour), Value: 1},
 		{MetricName: "retained", EntityID: "n1", Timestamp: now.Add(-60*24*time.Hour + 10*time.Minute), Value: 2},
 		{MetricName: "retained", EntityID: "n1", Timestamp: now.Add(-50 * 24 * time.Hour), Value: 3},
-		{MetricName: "longer-retained", EntityID: "n1", Timestamp: now.Add(-70 * 24 * time.Hour), Value: 4},
+		{MetricName: "longer-retained", EntityID: "n1", Timestamp: now.Add(-100 * 24 * time.Hour), Value: 4},
 	}
-	if err := s.WriteBatch(ctx, points); err != nil {
-		t.Fatalf("write: %v", err)
+	for _, point := range points {
+		writeRollupPointsAt(t, ctx, s, point.Timestamp.Add(time.Minute), point)
 	}
 	if _, err := s.Compact(ctx, now); err != nil {
 		t.Fatalf("compact: %v", err)
@@ -856,7 +1155,7 @@ func TestCompactHonorsMetricRetentionForCoarsestTier(t *testing.T) {
 		t.Fatalf("unexpected retained values: %#v", got)
 	}
 	longer, err := s.AggregateRollup(ctx, AggregateQuery{
-		Query:       Query{MetricName: "longer-retained", EntityID: "n1", Start: now.Add(-80 * 24 * time.Hour), End: now},
+		Query:       Query{MetricName: "longer-retained", EntityID: "n1", Start: now.Add(-130 * 24 * time.Hour), End: now},
 		Aggregation: AggSum,
 		Interval:    time.Hour,
 	}, time.Hour)
@@ -865,5 +1164,105 @@ func TestCompactHonorsMetricRetentionForCoarsestTier(t *testing.T) {
 	}
 	if len(longer) != 1 || longer[0].Value != 4 {
 		t.Fatalf("metric retention leaked across definitions: %#v", longer)
+	}
+}
+
+func TestZeroRetentionPurgesDataAndDisablesFurtherPersistence(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{
+		RawRetention: 15 * time.Minute,
+		Tiers: []RollupTier{
+			{Interval: time.Minute, Retention: 48 * time.Hour},
+			{Interval: 5 * time.Minute, Retention: 14 * 24 * time.Hour},
+			{Interval: time.Hour, Retention: 30 * 24 * time.Hour},
+		},
+	}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "disabled", Type: TypeGauge, RetentionDays: 0}); err != nil {
+		t.Fatalf("create disabled metric: %v", err)
+	}
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	def, err := s.GetMetric(ctx, "disabled")
+	if err != nil || def.RetentionDays != 0 {
+		t.Fatalf("CreateMetric did not persist zero retention: %#v, err=%v", def, err)
+	}
+	if err := s.Write(ctx, Point{MetricName: "disabled", EntityID: "node", Timestamp: now, Value: 1}); err != nil {
+		t.Fatalf("write disabled metric: %v", err)
+	}
+	raw, err := s.Query(ctx, Query{MetricName: "disabled", EntityID: "node", Start: now.Add(-time.Hour), End: now.Add(time.Hour)})
+	if err != nil || len(raw) != 0 {
+		t.Fatalf("CreateMetric zero persisted data: %#v, err=%v", raw, err)
+	}
+	if err := s.UpsertMetric(ctx, Definition{Name: "disabled", Type: TypeGauge, RetentionDays: 30}); err != nil {
+		t.Fatalf("enable metric: %v", err)
+	}
+	if err := s.Write(ctx, Point{MetricName: "disabled", EntityID: "node", Timestamp: now.Add(-time.Hour), Value: 1}); err != nil {
+		t.Fatalf("write initial point: %v", err)
+	}
+	if _, err := s.CompactMetric(ctx, "disabled", now); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	rollups, err := s.AggregateRollup(ctx, AggregateQuery{
+		Query:       Query{MetricName: "disabled", EntityID: "node", Start: now.Add(-2 * time.Hour), End: now},
+		Aggregation: AggSum,
+		Interval:    time.Minute,
+	}, time.Minute)
+	if err != nil || len(rollups) == 0 {
+		t.Fatalf("expected persisted rollup before disable, got %#v, err=%v", rollups, err)
+	}
+
+	if err := s.UpsertMetric(ctx, Definition{Name: "disabled", Type: TypeGauge, RetentionDays: 0}); err != nil {
+		t.Fatalf("upsert zero retention: %v", err)
+	}
+	def, err = s.GetMetric(ctx, "disabled")
+	if err != nil || def.RetentionDays != 0 {
+		t.Fatalf("UpsertMetric did not persist zero retention: %#v, err=%v", def, err)
+	}
+	raw, err = s.Query(ctx, Query{MetricName: "disabled", EntityID: "node", Start: now.Add(-2 * time.Hour), End: now})
+	if err != nil || len(raw) != 0 {
+		t.Fatalf("raw data remained after disable: %#v, err=%v", raw, err)
+	}
+	rollups, err = s.AggregateRollup(ctx, AggregateQuery{
+		Query:       Query{MetricName: "disabled", EntityID: "node", Start: now.Add(-2 * time.Hour), End: now},
+		Aggregation: AggSum,
+		Interval:    time.Minute,
+	}, time.Minute)
+	if err != nil || len(rollups) != 0 {
+		t.Fatalf("rollup data remained after disable: %#v, err=%v", rollups, err)
+	}
+	if err := s.Write(ctx, Point{MetricName: "disabled", EntityID: "node", Timestamp: now, Value: 2}); err != nil {
+		t.Fatalf("write disabled metric: %v", err)
+	}
+	raw, err = s.Query(ctx, Query{MetricName: "disabled", EntityID: "node", Start: now.Add(-time.Hour), End: now.Add(time.Hour)})
+	if err != nil || len(raw) != 0 {
+		t.Fatalf("disabled metric persisted a new point: %#v, err=%v", raw, err)
+	}
+	if written, err := s.CompactMetric(ctx, "disabled", now); err != nil || written != 0 {
+		t.Fatalf("disabled metric compacted %d buckets, err=%v", written, err)
+	}
+}
+
+func TestCompactPurgesZeroRetentionWithoutRollups(t *testing.T) {
+	ctx := context.Background()
+	s := newMemStore(t)
+	if err := s.CreateMetric(ctx, Definition{Name: "disabled", Type: TypeGauge, RetentionDays: 30}); err != nil {
+		t.Fatalf("create metric: %v", err)
+	}
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	if err := s.Write(ctx, Point{MetricName: "disabled", EntityID: "node", Timestamp: now, Value: 1}); err != nil {
+		t.Fatalf("write point: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		fmt.Sprintf("UPDATE %s SET retention_days = ? WHERE name = ?", s.tables.definitions),
+		0, "disabled",
+	); err != nil {
+		t.Fatalf("seed disabled definition: %v", err)
+	}
+	if written, err := s.Compact(ctx, now); err != nil || written != 0 {
+		t.Fatalf("compact = %d, err=%v", written, err)
+	}
+	points, err := s.Query(ctx, Query{MetricName: "disabled", EntityID: "node", Start: now.Add(-time.Hour), End: now.Add(time.Hour)})
+	if err != nil || len(points) != 0 {
+		t.Fatalf("zero-retention data remained without rollups: %#v, err=%v", points, err)
 	}
 }

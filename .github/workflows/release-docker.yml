@@ -56,7 +56,7 @@ jobs:
           VERSION: ${{ github.event.inputs.version }}
         run: |
           VERSION_HASH="${{ github.sha }}"
-          LDFLAGS="-s -w -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_HASH}"
+          LDFLAGS="-s -w -extldflags=-Wl,--strip-all -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_HASH}"
 
           echo "Building for linux/amd64..."
           GOARCH=amd64 CC="zig cc -target x86_64-linux-musl" go build -trimpath -ldflags="$LDFLAGS" -o komari-linux-amd64
@@ -107,7 +107,6 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ github.event.inputs.version }}
-            type=raw,value=latest
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5

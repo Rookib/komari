@@ -231,3 +231,22 @@ func TestCapTrafficTotals(t *testing.T) {
 
 	assert.Equal(t, notifier.TrafficTotals{Up: 5 * 1024, Down: 6 * 1024}, unchanged)
 }
+
+func TestNewBotRejectsInsecureAndCredentialedEndpoints(t *testing.T) {
+	for _, endpoint := range []string{"http://example.com/bot", "https://user:secret@example.com/bot", "https://example.com/bot?secret=1", "https://example.com/bot#token"} {
+		_, err := newBot(telegramprovider.Addition{BotToken: "private-token", ChatID: "42", Endpoint: endpoint})
+		if err == nil {
+			t.Errorf("insecure endpoint accepted: %s", endpoint)
+		}
+		if err != nil && strings.Contains(err.Error(), "secret") {
+			t.Error("credential leaked through error")
+		}
+	}
+}
+
+func TestBotTransportErrorDoesNotExposeToken(t *testing.T) {
+	b := &bot{baseURL: "http://127.0.0.1:1/bot-private-token", client: &http.Client{Timeout: time.Second}}
+	err := b.call(context.Background(), "getUpdates", url.Values{}, nil)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "private-token")
+}

@@ -2,11 +2,13 @@ package email
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"html"
 	"mime"
 	"mime/quotedprintable"
+	"net"
 	"net/mail"
 	"net/smtp"
 	"strconv"
@@ -14,15 +16,15 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/utils/messageSender/factory"
+	"github.com/komari-monitor/komari/utils/messageSender"
 )
 
 type EmailSender struct {
 	Addition
 }
 
-// loginAuth 是一个更宽松的 SMTP 认证实现,支持更多 SMTP 服务器
-// 它不会严格验证服务器主机名,从而兼容微软邮箱、网易邮箱等服务
+// loginAuth supports LOGIN authentication only after the connection has
+// completed certificate-verified TLS.
 type loginAuth struct {
 	username string
 	password string
@@ -30,6 +32,9 @@ type loginAuth struct {
 }
 
 func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS {
+		return "", nil, fmt.Errorf("SMTP authentication requires TLS")
+	}
 	return "LOGIN", []byte{}, nil
 }
 
@@ -53,8 +58,8 @@ func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 	return nil, nil
 }
 
-// plainAuthWithoutCheck 是一个不检查主机名的 PlainAuth 实现
-// 用于解决某些 SMTP 服务器主机名与配置不匹配的问题
+// plainAuthWithoutCheck retains compatibility with existing SMTP providers.
+// The connection verifies the certificate hostname before this auth runs.
 type plainAuthWithoutCheck struct {
 	identity string
 	username string
@@ -63,6 +68,9 @@ type plainAuthWithoutCheck struct {
 }
 
 func (a *plainAuthWithoutCheck) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS {
+		return "", nil, fmt.Errorf("SMTP authentication requires TLS")
+	}
 	resp := []byte(a.identity + "\x00" + a.username + "\x00" + a.password)
 	return "PLAIN", resp, nil
 }
@@ -74,22 +82,21 @@ func (a *plainAuthWithoutCheck) Next(fromServer []byte, more bool) ([]byte, erro
 	return nil, nil
 }
 
-func (e *EmailSender) GetName() string {
-	return "email"
+func Register() error {
+	return messageSender.RegisterNotificationChannel("email", messageSender.ManagedConfiguration("Email", Addition{}), &EmailSender{})
 }
-
-func (e *EmailSender) GetConfiguration() factory.Configuration {
-	return &e.Addition
+func (e *EmailSender) Unload() error { return nil }
+func (e *EmailSender) Send(ctx context.Context, n messageSender.Notification, values map[string]any) error {
+	var addition Addition
+	if err := messageSender.DecodeConfiguration(values, &addition); err != nil {
+		return err
+	}
+	sender := EmailSender{Addition: addition}
+	if n.Event.Event == "" {
+		return sender.sendMailContext(ctx, n.Message, "", n.Title)
+	}
+	return sender.sendMailContext(ctx, formatPlainEventEmail(n.Event), formatHTMLEventEmail(n.Event), n.Title)
 }
-
-func (e *EmailSender) Init() error {
-	return nil
-}
-
-func (e *EmailSender) Destroy() error {
-	return nil
-}
-
 func (e *EmailSender) SendTextMessage(message, title string) error {
 	return e.sendMail(message, "", title)
 }
@@ -97,10 +104,15 @@ func (e *EmailSender) SendTextMessage(message, title string) error {
 func (e *EmailSender) SendEvent(event models.EventMessage) error {
 	plain := formatPlainEventEmail(event)
 	htmlBody := formatHTMLEventEmail(event)
-	return e.sendMail(plain, htmlBody, event.Event)
+	return e.sendMail(plain, htmlBody, eventText(event.Event))
 }
 
 func (e *EmailSender) sendMail(plainBody, htmlBody, title string) error {
+	return e.sendMailContext(context.Background(), plainBody, htmlBody, title)
+}
+func (e *EmailSender) sendMailContext(ctx context.Context, plainBody, htmlBody, title string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if e.Addition.Host == "" || e.Addition.Sender == "" || e.Addition.Username == "" || e.Addition.Password == "" || e.Addition.Receiver == "" {
 		return fmt.Errorf("email sending is not fully configured")
 	}
@@ -176,97 +188,59 @@ func (e *EmailSender) sendMail(plainBody, htmlBody, title string) error {
 		return err
 	}
 
-	addr := e.Addition.Host + ":" + strconv.Itoa(e.Addition.Port)
-
-	if e.Addition.UseSSL {
-		// Use TLS. If port is 465, prefer implicit TLS. Otherwise, use STARTTLS.
-		if e.Addition.Port == 465 {
-			// Implicit TLS (SMTPS)
-			tlsCfg := &tls.Config{ServerName: e.Addition.Host}
-			conn, err := tls.Dial("tcp", addr, tlsCfg)
-			if err != nil {
-				return fmt.Errorf("failed to establish implicit TLS connection: %w", err)
-			}
-			defer conn.Close()
-
-			c, err := smtp.NewClient(conn, e.Addition.Host)
-			if err != nil {
-				return fmt.Errorf("failed to create SMTP client over TLS: %w", err)
-			}
-			defer c.Close()
-
-			if err = c.Auth(auth); err != nil {
-				return fmt.Errorf("failed to authenticate: %w", err)
-			}
-
-			if err = c.Mail(senderAddr); err != nil {
-				return fmt.Errorf("failed to set sender: %w", err)
-			}
-			for _, rcpt := range rcptList {
-				if err = c.Rcpt(rcpt); err != nil {
-					return fmt.Errorf("failed to add recipient %s: %w", rcpt, err)
-				}
-			}
-
-			w, err := c.Data()
-			if err != nil {
-				return fmt.Errorf("failed to get data writer: %w", err)
-			}
-			if _, err = w.Write(fullMsg); err != nil {
-				return fmt.Errorf("failed to write message: %w", err)
-			}
-			if err = w.Close(); err != nil {
-				return fmt.Errorf("failed to close data writer: %w", err)
-			}
-			return c.Quit()
-		} else {
-			// STARTTLS
-			c, err := smtp.Dial(addr)
-			if err != nil {
-				return fmt.Errorf("failed to dial SMTP server: %w", err)
-			}
-			defer c.Close()
-
-			if err = c.StartTLS(&tls.Config{ServerName: e.Addition.Host}); err != nil {
-				return fmt.Errorf("failed to start TLS: %w", err)
-			}
-
-			if err = c.Auth(auth); err != nil {
-				return fmt.Errorf("failed to authenticate: %w", err)
-			}
-
-			if err = c.Mail(senderAddr); err != nil {
-				return fmt.Errorf("failed to set sender: %w", err)
-			}
-			for _, rcpt := range rcptList {
-				if err = c.Rcpt(rcpt); err != nil {
-					return fmt.Errorf("failed to add recipient %s: %w", rcpt, err)
-				}
-			}
-
-			w, err := c.Data()
-			if err != nil {
-				return fmt.Errorf("failed to get data writer: %w", err)
-			}
-			if _, err = w.Write(fullMsg); err != nil {
-				return fmt.Errorf("failed to write message: %w", err)
-			}
-			if err = w.Close(); err != nil {
-				return fmt.Errorf("failed to close data writer: %w", err)
-			}
-
-			return c.Quit()
-		}
+	addr := net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	var conn net.Conn
+	if e.UseSSL && e.Port == 465 {
+		conn, err = (&tls.Dialer{NetDialer: dialer, Config: &tls.Config{ServerName: e.Host, MinVersion: tls.VersionTLS12}}).DialContext(ctx, "tcp", addr)
 	} else {
-		// Send without SSL/TLS (less secure). We still reuse the composed message and parsed addresses.
-		return smtp.SendMail(
-			addr,
-			auth,
-			senderAddr,
-			rcptList,
-			fullMsg,
-		)
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
+	if err != nil {
+		return fmt.Errorf("SMTP connection failed: %w", err)
+	}
+	defer conn.Close()
+	deadline, _ := ctx.Deadline()
+	if err = conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	c, err := smtp.NewClient(conn, e.Host)
+	if err != nil {
+		return fmt.Errorf("SMTP greeting failed: %w", err)
+	}
+	defer c.Close()
+	if !(e.UseSSL && e.Port == 465) {
+		// Never transmit configured credentials on an unencrypted connection.
+		// Retain the old UseSSL field for config compatibility; all other SMTP
+		// connections require STARTTLS before authentication.
+		if err = c.StartTLS(&tls.Config{ServerName: e.Host, MinVersion: tls.VersionTLS12}); err != nil {
+			return fmt.Errorf("SMTP requires STARTTLS: %w", err)
+		}
+	}
+	if err = c.Auth(auth); err != nil {
+		return fmt.Errorf("SMTP authentication failed: %w", err)
+	}
+	if err = c.Mail(senderAddr); err != nil {
+		return err
+	}
+	for _, rcpt := range rcptList {
+		if err = c.Rcpt(rcpt); err != nil {
+			return err
+		}
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(fullMsg); err != nil {
+		return err
+	}
+	if err = w.Close(); err != nil {
+		return err
+	}
+	return c.Quit()
 }
 
 func buildSenderAddress(sender, fromName string) (string, string) {
@@ -288,8 +262,7 @@ func buildSenderAddress(sender, fromName string) (string, string) {
 }
 
 // 确保实现了 IMessageSender 接口
-var _ factory.IMessageSender = (*EmailSender)(nil)
-var _ factory.IEventMessageSender = (*EmailSender)(nil)
+var _ messageSender.NotificationChannel = (*EmailSender)(nil)
 
 func buildMIMEMessage(headers []string, plainBody, htmlBody string) ([]byte, error) {
 	if strings.TrimSpace(plainBody) == "" {
@@ -351,38 +324,38 @@ func formatPlainEventEmail(event models.EventMessage) string {
 
 func formatFallbackEventEmail(event models.EventMessage) string {
 	clientText := eventClientText(event)
-	switch event.Event {
+	switch eventText(event.Event) {
 	case "SSH 登录成功":
 		return strings.Join([]string{
 			"🔐 SSH 安全登录提醒",
 			"节点名称：" + clientText,
-			event.Message,
+			eventText(event.Message),
 			"✅ SSH 会话已成功建立",
 		}, "\n")
 	case "SSH 爆破告警":
 		return strings.Join([]string{
 			"🚨 SSH 爆破告警",
-			event.Message,
+			eventText(event.Message),
 			"该告警只代表检测到失败登录行为。",
 		}, "\n")
 	case "Offline":
-		return "🔴 节点离线告警\n节点名称：" + clientText + "\n" + event.Message
+		return "🔴 节点离线告警\n节点名称：" + clientText + "\n" + eventText(event.Message)
 	case "Online":
-		return "🟢 节点恢复在线\n节点名称：" + clientText + "\n" + event.Message
+		return "🟢 节点恢复在线\n节点名称：" + clientText + "\n" + eventText(event.Message)
 	default:
-		if strings.TrimSpace(event.Message) != "" {
-			return event.Event + "\n节点名称：" + clientText + "\n" + event.Message
+		if strings.TrimSpace(eventText(event.Message)) != "" {
+			return eventText(event.Event) + "\n节点名称：" + clientText + "\n" + eventText(event.Message)
 		}
-		return event.Event + "\n节点名称：" + clientText
+		return eventText(event.Event) + "\n节点名称：" + clientText
 	}
 }
 
 func formatHTMLEventEmail(event models.EventMessage) string {
 	clientText := eventClientText(event)
-	fields := parseEventFields(event.Message)
+	fields := parseEventFields(eventText(event.Message))
 	timeText := formatEmailEventTime(event.Time)
 
-	switch event.Event {
+	switch eventText(event.Event) {
 	case "SSH 爆破告警":
 		return htmlCard(emailCardOptions{
 			Accent:   "#f97316",
@@ -426,7 +399,7 @@ func formatHTMLEventEmail(event models.EventMessage) string {
 			Subtitle: "机器已离线，超过宽限期。",
 			Fields: []emailField{
 				{"节点名称", clientText},
-				{"说明", event.Message},
+				{"说明", eventText(event.Message)},
 				{"时间", timeText},
 			},
 			Footer:      "请检查机器网络、系统负载或探针进程状态。",
@@ -440,7 +413,7 @@ func formatHTMLEventEmail(event models.EventMessage) string {
 			Subtitle: "机器连接已恢复。",
 			Fields: []emailField{
 				{"节点名称", clientText},
-				{"说明", event.Message},
+				{"说明", eventText(event.Message)},
 				{"时间", timeText},
 			},
 			Footer:      "节点当前已恢复在线。",
@@ -450,11 +423,11 @@ func formatHTMLEventEmail(event models.EventMessage) string {
 	default:
 		return htmlCard(emailCardOptions{
 			Accent:   "#4f46e5",
-			Title:    event.Event,
+			Title:    eventText(event.Event),
 			Subtitle: "Komari 通知",
 			Fields: []emailField{
 				{"节点名称", clientText},
-				{"说明", event.Message},
+				{"说明", eventText(event.Message)},
 				{"时间", timeText},
 			},
 			Footer:      "来自 Komari Monitor",
@@ -577,4 +550,11 @@ func htmlToText(body string) string {
 		}
 	}
 	return strings.TrimSpace(html.UnescapeString(out.String()))
+}
+
+func eventText(v any) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprint(v)
 }

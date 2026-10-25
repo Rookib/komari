@@ -1,6 +1,7 @@
 package messageSender
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -8,7 +9,6 @@ import (
 
 	"github.com/komari-monitor/komari/database/models"
 	messageevent "github.com/komari-monitor/komari/database/models/messageEvent"
-	"github.com/komari-monitor/komari/utils/messageSender/factory"
 )
 
 const sshSuccessGlobalTemplate = `🔐 SSH 安全登录提醒
@@ -131,7 +131,7 @@ func TestEventDisplayTitleUsesChineseForBuiltInEvents(t *testing.T) {
 
 func TestProviderNamesFromValueDedupAndFilter(t *testing.T) {
 	got := providerNamesFromValue([]any{"telegram", "email", "telegram", "none", "", "missing-provider"})
-	want := []string{"telegram", "email"}
+	want := []string{"telegram", "email", "missing-provider"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("providerNamesFromValue = %#v, want %#v", got, want)
 	}
@@ -145,68 +145,46 @@ func TestProviderNamesFromJSONListString(t *testing.T) {
 	}
 }
 
-func TestSendTextMessageToProvidersSucceedsIfOneChannelSucceeds(t *testing.T) {
-	tg := &fakeSender{name: "telegram"}
-	email := &fakeSender{name: "email", textErr: errors.New("smtp failed")}
+func TestChannelFanoutContinuesAfterFailureWithoutRetry(t *testing.T) {
+	var calls []string
 	var logs []string
-
-	err := sendTextMessageToProviders([]namedProvider{
-		{name: "telegram", provider: tg},
-		{name: "email", provider: email},
-	}, "hello", "Test", func(_, _, message, level string) {
-		logs = append(logs, level+":"+message)
-	})
-
+	err := sendToChannels(context.Background(), []string{"telegram", "plugin:custom"}, Notification{Message: "hello"},
+		func(_ context.Context, id string, n Notification) error {
+			calls = append(calls, id)
+			if n.Message != "hello" {
+				t.Fatalf("message changed: %#v", n)
+			}
+			if id == "telegram" {
+				return errors.New("sensitive URL and token")
+			}
+			return nil
+		}, func(_, _, message, level string) { logs = append(logs, level+":"+message) })
 	if err != nil {
-		t.Fatalf("expected overall success when one provider succeeds, got %v", err)
+		t.Fatalf("partial delivery failed: %v", err)
 	}
-	if tg.textCalls != 1 || email.textCalls != 3 {
-		t.Fatalf("unexpected text calls: telegram=%d email=%d", tg.textCalls, email.textCalls)
+	if strings.Join(calls, ",") != "telegram,plugin:custom" {
+		t.Fatalf("unexpected calls: %v", calls)
 	}
-	assertJoinedContains(t, logs, "info:Message sent via telegram: Test")
-	assertJoinedContains(t, logs, "error:Failed to send message via email")
+	assertJoinedContains(t, logs, "Failed to send notification via telegram")
+	assertNotContains(t, strings.Join(logs, " "), "sensitive URL and token")
 }
 
-func TestSendTextMessageToProvidersFailsIfAllChannelsFail(t *testing.T) {
-	tg := &fakeSender{name: "telegram", textErr: errors.New("tg failed")}
-	email := &fakeSender{name: "email", textErr: errors.New("smtp failed")}
-
-	err := sendTextMessageToProviders([]namedProvider{
-		{name: "telegram", provider: tg},
-		{name: "email", provider: email},
-	}, "hello", "Test", nil)
-
+func TestChannelFanoutReportsAllFailuresWithoutCredentials(t *testing.T) {
+	err := sendToChannels(context.Background(), []string{"telegram", "email"}, Notification{},
+		func(context.Context, string, Notification) error { return errors.New("secret-token") }, nil)
 	if err == nil {
-		t.Fatal("expected error when all providers fail")
+		t.Fatal("all failures must report an error")
 	}
 	assertContains(t, err.Error(), "telegram")
 	assertContains(t, err.Error(), "email")
+	assertNotContains(t, err.Error(), "secret-token")
 }
 
-func TestSendEventToProvidersSendsSSHAuthGuardToEveryProvider(t *testing.T) {
-	tg := &fakeSender{name: "telegram"}
-	email := &fakeSender{name: "email"}
-
-	err := sendEventToProviders([]namedProvider{
-		{name: "telegram", provider: tg},
-		{name: "email", provider: email},
-	}, models.EventMessage{
-		Event:   "SSH 爆破告警",
-		Clients: []models.Client{{Name: "node-a"}},
-		Time:    time.Date(2026, 6, 24, 8, 0, 0, 0, time.UTC),
-		Message: "服务器：node-a\n来源 IP：203.0.113.1\n目标用户：root\n认证方式：密码\n失败次数：5\n统计窗口：60 秒\n时间：2026-06-24 16:00:00 北京时间\n\n说明：该告警只代表检测到 SSH 登录失败 / 爆破行为，未执行封禁命令。",
-	}, "{{message}}", nil)
-
-	if err != nil {
-		t.Fatalf("expected event success, got %v", err)
+func TestChannelNamesPreservePluginCase(t *testing.T) {
+	got := providerNamesFromValue([]any{"Javascript", "MyPlugin/channel", "Javascript", "none"})
+	if strings.Join(got, ",") != "Javascript,MyPlugin/channel" {
+		t.Fatalf("IDs were changed: %v", got)
 	}
-	if tg.textCalls != 1 || email.textCalls != 1 {
-		t.Fatalf("expected both providers to receive event text once, got telegram=%d email=%d", tg.textCalls, email.textCalls)
-	}
-	assertContains(t, tg.lastMessage, "🚨 SSH 爆破告警")
-	assertContains(t, email.lastMessage, "🚨 SSH 爆破告警")
-	assertNotContains(t, tg.lastMessage, "SSH 会话已成功建立")
-	assertNotContains(t, email.lastMessage, "SSH 会话已成功建立")
 }
 
 func TestShouldSilenceSSHAuthGuardEventOnlyAffectsAuthGuardAlerts(t *testing.T) {
@@ -222,37 +200,6 @@ func TestShouldSilenceSSHAuthGuardEventOnlyAffectsAuthGuardAlerts(t *testing.T) 
 	if shouldSilenceSSHAuthGuardEvent(models.EventMessage{Event: "SSH 爆破告警"}, false) {
 		t.Fatal("auth guard alert must not be silenced when silent mode is disabled")
 	}
-}
-
-type fakeSender struct {
-	name        string
-	textErr     error
-	textCalls   int
-	lastMessage string
-	lastTitle   string
-}
-
-func (f *fakeSender) GetName() string {
-	return f.name
-}
-
-func (f *fakeSender) GetConfiguration() factory.Configuration {
-	return &struct{}{}
-}
-
-func (f *fakeSender) SendTextMessage(message, title string) error {
-	f.textCalls++
-	f.lastMessage = message
-	f.lastTitle = title
-	return f.textErr
-}
-
-func (f *fakeSender) Init() error {
-	return nil
-}
-
-func (f *fakeSender) Destroy() error {
-	return nil
 }
 
 func assertContains(t *testing.T, text, want string) {

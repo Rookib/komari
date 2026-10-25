@@ -1,37 +1,33 @@
 package messageSender
 
 import (
-	"github.com/komari-monitor/komari/database"
+	"context"
+	"github.com/komari-monitor/komari/database/auditlog"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
+	"time"
 )
 
-// SendEventAndEmailCopy is kept for older notifier call sites. Multi-provider
-// fan-out now lives in SendEvent itself.
-func SendEventAndEmailCopy(event models.EventMessage) error {
-	return SendEvent(event)
-}
-
-// SendEventWithProvider sends one event through a named, already-configured
-// provider without replacing the panel's active notification provider.
+// Compatibility entry point for custom notifier call sites; routing is shared.
+func SendEventAndEmailCopy(event models.EventMessage) error { return SendEvent(event) }
 func SendEventWithProvider(name string, event models.EventMessage) error {
 	enabled, err := config.GetAs[bool](config.NotificationEnabledKey, false)
 	if err != nil || !enabled {
 		return err
 	}
-	saved, err := database.GetMessageSenderConfigByName(name)
+	silent, err := config.GetAs[bool](config.SSHAuthGuardSilentModeKey, true)
 	if err != nil {
 		return err
 	}
-	provider, err := loadProviderInstance(name, saved.Addition)
+	if shouldSilenceSSHAuthGuardEvent(event, silent) {
+		return nil
+	}
+	template, err := config.GetAs[string](config.NotificationTemplateKey, defaultTemplate)
 	if err != nil {
 		return err
 	}
-	defer provider.Destroy()
-
-	template, err := config.GetAs[string](config.NotificationTemplateKey, "{{emoji}}{{emoji}}{{emoji}}\nEvent: {{event}}\nClients: {{client}}\nMessage: {{message}}\nTime: {{time}}")
-	if err != nil {
-		return err
+	if event.Time.IsZero() {
+		event.Time = time.Now().UTC()
 	}
-	return sendEventToProvider(provider, event, template)
+	return sendToChannels(context.Background(), []string{name}, Notification{Event: event, Title: eventDisplayTitle(event), Message: formatEventMessage(template, event)}, CallNotificationChannel, auditlog.Log)
 }

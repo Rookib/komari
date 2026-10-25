@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/database/auditlog"
 	"github.com/komari-monitor/komari/database/securityactions"
+	"github.com/komari-monitor/komari/pkg/rpc"
 	"github.com/komari-monitor/komari/web/api"
 )
 
@@ -17,7 +18,7 @@ type securityActionAckRequest struct {
 }
 
 func ListSecurityActions(c *gin.Context) {
-	clientUUID, ok := clientUUIDFromContext(c)
+	clientUUID, ok := securityClientUUIDFromContext(c)
 	if !ok {
 		api.RespondError(c, http.StatusUnauthorized, "client token required")
 		return
@@ -31,7 +32,7 @@ func ListSecurityActions(c *gin.Context) {
 }
 
 func AckSecurityAction(c *gin.Context) {
-	clientUUID, ok := clientUUIDFromContext(c)
+	clientUUID, ok := securityClientUUIDFromContext(c)
 	if !ok {
 		api.RespondError(c, http.StatusUnauthorized, "client token required")
 		return
@@ -53,4 +54,14 @@ func AckSecurityAction(c *gin.Context) {
 		"info",
 	)
 	api.RespondSuccess(c, gin.H{"action": action})
+}
+
+// Firewall queues are bound to the authenticated agent principal. A user or API
+// key must not turn into an agent by adding a client token or UUID to a request.
+func securityClientUUIDFromContext(c *gin.Context) (string, bool) {
+	principal := api.GetPrincipal(c)
+	if principal == nil || principal.Type != rpc.PrincipalAgent || principal.ClientUUID == "" {
+		return "", false
+	}
+	return principal.ClientUUID, true
 }

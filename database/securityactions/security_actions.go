@@ -2,12 +2,13 @@ package securityactions
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 )
 
 const queueKey = "security_action_queue"
@@ -45,14 +46,17 @@ func Enqueue(clientUUID, ip, action string, duration int) (Action, error) {
 	if clientUUID == "" {
 		return Action{}, fmt.Errorf("client is required")
 	}
-	if ip == "" {
-		return Action{}, fmt.Errorf("ip is required")
+	if net.ParseIP(ip) == nil {
+		return Action{}, fmt.Errorf("a single valid IP is required")
 	}
 	if action != ActionBan && action != ActionUnban {
 		return Action{}, fmt.Errorf("invalid action")
 	}
 	if duration <= 0 {
 		duration = 3600
+	}
+	if duration > 86400 {
+		return Action{}, fmt.Errorf("duration exceeds 86400 seconds")
 	}
 
 	queueMu.Lock()

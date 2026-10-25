@@ -15,6 +15,7 @@ komari.db
 /utils/geoip/data
 .vscode/
 /backup
+/cache
 
 # Test binary, built with `go test -c`
 *.test
@@ -34,4 +35,7 @@ go.work.sum
 
 # build
 komari
+/dist/
 .codex
+
+/web/filemanager/data

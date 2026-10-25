@@ -1,7 +1,12 @@
 package cmd
 
 import (
-	"log"
+	"errors"
+	"os"
+
+	appserver "github.com/komari-monitor/komari/internal/server"
+	logger "github.com/komari-monitor/komari/utils/log"
+	frontendpublic "github.com/komari-monitor/komari/web/public"
 
 	"github.com/komari-monitor/komari/cmd/flags"
 	"github.com/spf13/cobra"
@@ -25,18 +30,80 @@ func init() {
 
 // RunServer 按显式的生命周期阶段启动服务端。
 //
-// 具体各阶段的职责与顺序见 App（cmd/app.go）。这里只负责串联：
+// 具体各阶段的职责与顺序见 internal/server.App。这里只负责串联：
 // 任一初始化阶段失败即中止启动，避免在半初始化状态下对外提供服务。
 func RunServer() {
-	app := NewApp()
+	if err := frontendpublic.PrepareDefaultDist(); err != nil {
+		logger.Fatalf("server", "prepare default frontend failed: %v", err)
+	}
 
-	// 初始化阶段：任一步失败都不应继续对外服务。
+	app := appserver.New(appserver.Options{ListenAddr: flags.Listen})
+	if err := app.Bootstrap(); err != nil {
+		_ = app.Shutdown()
+		logger.Fatalf("server", "server startup failed at %q: %v", "bootstrap", err)
+	}
+
+	installRequired, err := app.InstallRequired()
+	if err != nil {
+		_ = app.Shutdown()
+		logger.Fatalf("server", "server startup failed at %q: %v", "detect-first-run-install", err)
+	}
+	if installRequired {
+		completed, err := app.RunInstallGuide()
+		if err != nil {
+			_ = app.Shutdown()
+			logger.Fatalf("server", "server startup failed at %q: %v", "run-first-run-install", err)
+		}
+		if !completed {
+			return
+		}
+	}
+
+	for {
+		requirement, err := app.DatabaseMigrationRequired()
+		if err != nil {
+			completed, recoveryErr := app.RunMetricStoreRecovery(err)
+			if recoveryErr != nil {
+				_ = app.Shutdown()
+				logger.Fatalf("server", "server startup failed at %q: %v", "database-migration-detection-recovery", recoveryErr)
+			}
+			if !completed {
+				return
+			}
+			continue
+		}
+		if !requirement.Required() {
+			break
+		}
+		completed, err := app.RunDatabaseMigration(requirement)
+		if err != nil {
+			_ = app.Shutdown()
+			logger.Fatalf("server", "server startup failed at %q: %v", "run-database-migration", err)
+		}
+		if !completed {
+			return
+		}
+	}
+
+	// Metric store 是唯一允许进入恢复向导的启动阶段：主库已经在
+	// Bootstrap 中就绪，因此可以保留登录能力并让管理员修正 DSN。
+	if err := app.ConnectMetricStoreWithRetry(); err != nil {
+		completed, recoveryErr := app.RunMetricStoreRecovery(err)
+		if recoveryErr != nil {
+			_ = app.Shutdown()
+			logger.Fatalf("server", "server startup failed at %q: %v", "metric-store-recovery", recoveryErr)
+		}
+		if !completed {
+			return
+		}
+	}
+
+	// 其余初始化阶段：任一步失败都不应继续对外服务。
 	type stage struct {
 		name string
 		fn   func() error
 	}
 	stages := []stage{
-		{"bootstrap", app.Bootstrap},
 		{"init-stores", app.InitStores},
 		{"init-providers", app.InitProviders},
 		{"start-background", app.StartBackground},
@@ -46,11 +113,15 @@ func RunServer() {
 		if err := s.fn(); err != nil {
 			// 已登记的资源尽力回收，再退出。
 			_ = app.Shutdown()
-			log.Fatalf("server startup failed at %q: %v", s.name, err)
+			logger.Fatalf("server", "server startup failed at %q: %v", s.name, err)
 		}
 	}
 
 	if err := app.Run(); err != nil {
-		log.Fatalf("server exited with error: %v", err)
+		if errors.Is(err, appserver.ErrRestartRequested) {
+			logger.Infof("server", "Service stopped for restart: %v", err)
+			os.Exit(1)
+		}
+		logger.Fatalf("server", "server exited with error: %v", err)
 	}
 }

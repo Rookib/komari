@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,9 +12,10 @@ import (
 
 	"github.com/komari-monitor/komari/cmd/flags"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/config"
-	"github.com/komari-monitor/komari/pkg/migrations"
-	logutil "github.com/komari-monitor/komari/utils/log"
+	"github.com/komari-monitor/komari/internal/config"
+	"github.com/komari-monitor/komari/internal/migrations"
+	"github.com/komari-monitor/komari/internal/sqlitetune"
+	logger "github.com/komari-monitor/komari/utils/log"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -176,8 +176,22 @@ var (
 // 也避免额外的裸文件依赖。
 const SystemVersionKey = "system_version"
 
+const (
+	mainSQLiteBusyTimeout       = 5 * time.Second
+	mainSQLiteCacheSizeKB       = 8 * 1024
+	mainSQLiteWALAutoCheckpoint = 256
+	mainSQLiteJournalSizeLimit  = 1 << 20
+)
+
 // versionID 是当前构建的版本标识，由 SetVersionID 在 Initialize 前注入。
 var versionID string
+
+// nil means a fresh install; an empty value means an unmarked legacy install.
+var lastRunVersion *string
+
+func LastRunVersion() *string {
+	return lastRunVersion
+}
 
 // dbFileExistedAtStartup 记录本次进程启动、打开数据库之前 komari.db 是否已存在，
 // 用于区分“全新安装”与“从旧版升级（无版本标记）”。在 doInitialize 打开数据库
@@ -200,7 +214,7 @@ func resolveDatabaseFile() string {
 }
 
 // backupOnVersionUpgrade 在检测到版本升级时，把当前 ./data 打包到
-// ./backup/upgrade-{time}.zip，便于升级（含 metrics 迁移）异常时回滚。
+// ./data/backup/upgrade-{time}.zip，便于升级（含 metrics 迁移）异常时回滚。
 //
 // 版本标识存放于配置库（configs 表，键 system_version），因此本函数必须在
 // config.SetDb 之后、一次性 metrics 迁移（InitStores）之前调用。
@@ -214,13 +228,17 @@ func resolveDatabaseFile() string {
 //
 // 备份失败不阻止启动，但打印明确错误；备份成功（或无需备份）后写入/更新版本。
 func backupOnVersionUpgrade() {
-	if versionID == "" {
-		return
-	}
-
 	prevVersion, readErr := config.GetAs[string](SystemVersionKey)
 	prevVersion = strings.TrimSpace(prevVersion)
 	versionRecorded := readErr == nil && prevVersion != ""
+	lastRunVersion = nil
+	if versionRecorded || dbFileExistedAtStartup {
+		lastRunVersion = &prevVersion
+	}
+
+	if versionID == "" {
+		return
+	}
 
 	// 版本未变化，无需备份。
 	if versionRecorded && prevVersion == versionID {
@@ -240,18 +258,19 @@ func backupOnVersionUpgrade() {
 		instance.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
 	}
 
-	if err := os.MkdirAll("./backup", 0755); err != nil {
-		log.Printf("[upgrade-backup] failed to create backup dir: %v", err)
+	backupDir := filepath.Join(".", "data", "backup")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		logger.Errorf("dbcore", "[upgrade-backup] failed to create backup dir: %v", err)
 		return
 	}
-	tsName := time.Now().Format("20060102-150405")
-	bakPath := filepath.Join("./backup", fmt.Sprintf("upgrade-%s.zip", tsName))
+	tsName := time.Now().UTC().Format("20060102-150405")
+	bakPath := filepath.Join(backupDir, fmt.Sprintf("upgrade-%s.zip", tsName))
 	backupZipPath := filepath.Join(".", "data", "backup.zip")
-	if zipErr := zipDirectoryExcluding("./data", bakPath, map[string]struct{}{backupZipPath: {}}); zipErr != nil {
-		log.Printf("[upgrade-backup] failed to backup ./data before upgrade (from %q to %q): %v", prevVersion, versionID, zipErr)
+	if zipErr := zipDirectoryExcluding("./data", bakPath, map[string]struct{}{backupZipPath: {}, backupDir: {}}); zipErr != nil {
+		logger.Errorf("dbcore", "[upgrade-backup] failed to backup ./data before upgrade (from %q to %q): %v", prevVersion, versionID, zipErr)
 		return
 	}
-	log.Printf("[upgrade-backup] ./data backed up to %s before upgrade (from %q to %q)", bakPath, prevVersion, versionID)
+	logger.Infof("dbcore", "[upgrade-backup] ./data backed up to %s before upgrade (from %q to %q)", bakPath, prevVersion, versionID)
 
 	writeVersionMarker()
 }
@@ -259,7 +278,7 @@ func backupOnVersionUpgrade() {
 // writeVersionMarker 将当前 versionID 写入配置库。
 func writeVersionMarker() {
 	if err := config.Set(SystemVersionKey, versionID); err != nil {
-		log.Printf("[upgrade-backup] failed to persist version marker: %v", err)
+		logger.Errorf("dbcore", "[upgrade-backup] failed to persist version marker: %v", err)
 	}
 }
 
@@ -268,7 +287,7 @@ func buildSQLiteDSN(databaseFile string) string {
 		databaseFile = "./data/komari.db"
 	}
 
-	params := "_busy_timeout=5000&_txlock=immediate&_journal_mode=WAL&_synchronous=NORMAL"
+	params := fmt.Sprintf("_busy_timeout=%d&_txlock=immediate", mainSQLiteBusyTimeout.Milliseconds())
 	separator := "?"
 	if strings.Contains(databaseFile, "?") {
 		separator = "&"
@@ -283,6 +302,19 @@ func buildSQLiteDSN(databaseFile string) string {
 	}
 
 	return "file:" + filepath.ToSlash(databaseFile) + separator + params
+}
+
+func mainSQLiteOptions() sqlitetune.Options {
+	return sqlitetune.Options{
+		BusyTimeout:           mainSQLiteBusyTimeout,
+		CacheSizeKB:           mainSQLiteCacheSizeKB,
+		MMapSizeBytes:         0,
+		TempStoreMemory:       false,
+		CacheSpill:            true,
+		WALAutoCheckpoint:     mainSQLiteWALAutoCheckpoint,
+		JournalSizeLimitBytes: mainSQLiteJournalSizeLimit,
+		Synchronous:           sqlitetune.SynchronousNormal,
+	}
 }
 
 // Initialize 显式初始化数据库连接与表结构，仅执行一次。
@@ -300,7 +332,7 @@ func Initialize() error {
 // 需要错误处理的启动流程应优先调用 Initialize()。
 func GetDBInstance() *gorm.DB {
 	if err := Initialize(); err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		logger.Fatalf("dbcore", "Failed to initialize database: %v", err)
 	}
 	return instance
 }
@@ -324,42 +356,43 @@ func doInitialize() error {
 	func() {
 		backupZipPath := filepath.Join(".", "data", "backup.zip")
 		if _, statErr := os.Stat(backupZipPath); statErr == nil {
-			// 4. 把除了 ./data/backup.zip 之外的所有文件压缩到 ./backup/{time}.zip
-			if err := os.MkdirAll("./backup", 0755); err != nil {
-				log.Printf("[restore] failed to create backup dir: %v", err)
+			// 4. 将当前数据快照保存到 ./data/backup/，并保留已有归档。
+			backupDir := filepath.Join(".", "data", "backup")
+			if err := os.MkdirAll(backupDir, 0755); err != nil {
+				logger.Errorf("dbcore", "[restore] failed to create backup dir: %v", err)
 			} else {
-				tsName := time.Now().Format("20060102-150405")
-				bakPath := filepath.Join("./backup", fmt.Sprintf("%s.zip", tsName))
-				if zipErr := zipDirectoryExcluding("./data", bakPath, map[string]struct{}{backupZipPath: {}}); zipErr != nil {
-					log.Printf("[restore] failed to zip current data: %v", zipErr)
+				tsName := time.Now().UTC().Format("20060102-150405")
+				bakPath := filepath.Join(backupDir, fmt.Sprintf("pre-restore-%s.zip", tsName))
+				if zipErr := zipDirectoryExcluding("./data", bakPath, map[string]struct{}{backupZipPath: {}, backupDir: {}}); zipErr != nil {
+					logger.Errorf("dbcore", "[restore] failed to zip current data: %v", zipErr)
 				} else {
-					log.Printf("[restore] current data zipped to %s", bakPath)
+					logger.Infof("dbcore", "[restore] current data zipped to %s", bakPath)
 				}
 			}
 
-			// 5. 删除除了 ./data/backup.zip 之外的所有文件
-			if delErr := removeAllInDirExcept("./data", map[string]struct{}{backupZipPath: {}}); delErr != nil {
-				log.Printf("[restore] failed to cleanup data dir: %v", delErr)
+			// 5. 删除数据文件，但保留归档目录和待恢复的 backup.zip。
+			if delErr := removeAllInDirExcept("./data", map[string]struct{}{backupZipPath: {}, backupDir: {}}); delErr != nil {
+				logger.Errorf("dbcore", "[restore] failed to cleanup data dir: %v", delErr)
 			}
 
 			// 6. 解压 ./data/backup.zip 到 ./data
 			if unzipErr := unzipToDir(backupZipPath, "./data"); unzipErr != nil {
-				log.Printf("[restore] failed to unzip backup into data: %v", unzipErr)
+				logger.Errorf("dbcore", "[restore] failed to unzip backup into data: %v", unzipErr)
 			} else {
-				log.Printf("[restore] backup.zip extracted to ./data")
+				logger.Infof("dbcore", "[restore] backup.zip extracted to ./data")
 			}
 
 			// 7. 删除 ./data/backup.zip
 			if rmErr := os.Remove(backupZipPath); rmErr != nil {
-				log.Printf("[restore] failed to remove backup.zip: %v", rmErr)
+				logger.Errorf("dbcore", "[restore] failed to remove backup.zip: %v", rmErr)
 			} else {
-				log.Printf("[restore] backup.zip removed")
+				logger.Infof("dbcore", "[restore] backup.zip removed")
 			}
 			// 8. 删除标记
 			if rmErr := os.Remove("./data/komari-backup-markup"); rmErr != nil {
-				log.Printf("[restore] failed to remove komari-backup-markup: %v", rmErr)
+				logger.Errorf("dbcore", "[restore] failed to remove komari-backup-markup: %v", rmErr)
 			} else {
-				log.Printf("[restore] komari-backup-markup removed")
+				logger.Infof("dbcore", "[restore] komari-backup-markup removed")
 			}
 		}
 	}()
@@ -372,47 +405,36 @@ func doInitialize() error {
 	}
 
 	logConfig := &gorm.Config{
-		Logger: logutil.NewGormLogger(),
+		Logger:  logger.NewGormLogger(),
+		NowFunc: func() time.Time { return time.Now().UTC() },
 	}
 
 	// 根据数据库类型选择不同的连接方式
 	switch flags.ApplyDatabaseTypeNormalization() {
 	case flags.DatabaseTypeSQLite:
-		// SQLite 连接
-		// 通过 DSN 传入 _busy_timeout / _txlock 等参数，确保连接池中的每一条连接
-		// 都生效：
-		//   - _busy_timeout=5000：遇到写锁时最多等待 5s 再返回，避免瞬时
-		//     "database is locked" 直接失败（仅靠后续 PRAGMA Exec 只作用于
-		//     当时执行该语句的单条连接，池内其它连接不生效）。
-		//   - _txlock=immediate：事务一开始即获取写锁，避免「先 SELECT 后写」
-		//     的锁升级在并发写入下产生死锁式的立即 SQLITE_BUSY。
-		//   - _journal_mode=WAL / _synchronous=NORMAL：与下方 PRAGMA 保持一致，
-		//     在 DSN 层为所有连接预设。
+		// _txlock=immediate lets writes acquire their lock before reads can
+		// turn into a lock-upgrade conflict. sqlitetune applies the remaining
+		// per-connection PRAGMAs whenever database/sql opens a connection.
 		dsn := buildSQLiteDSN(flags.DatabaseFile)
-		instance, err = gorm.Open(sqlite.Open(dsn), logConfig)
+		sqlDB, dbErr := sqlitetune.Open(dsn, mainSQLiteOptions())
+		if dbErr != nil {
+			return fmt.Errorf("open SQLite connection pool: %w", dbErr)
+		}
+		// SQLite has one writer. Keeping exactly one durable connection also
+		// keeps connection-local cache and WAL limits stable for the main DB.
+		sqlDB.SetMaxOpenConns(1)
+		sqlDB.SetMaxIdleConns(1)
+		sqlDB.SetConnMaxLifetime(0)
+		sqlDB.SetConnMaxIdleTime(0)
+
+		instance, err = gorm.Open(sqlite.New(sqlite.Config{Conn: sqlDB}), logConfig)
 		if err != nil {
+			_ = sqlDB.Close()
 			return fmt.Errorf("failed to connect to SQLite3 database: %w", err)
 		}
-		log.Printf("Using SQLite database file: %s", flags.DatabaseFile)
-		if sqlDB, dbErr := instance.DB(); dbErr == nil {
-			// SQLite 同一时刻只允许一个写者；限制连接数可避免连接池层面的写写竞争。
-			// 负载历史每分钟会执行包含读和写的事务，若连接池允许多个连接，容易与
-			// ping 结果等短写入撞锁并导致整批负载记录回滚。
-			sqlDB.SetMaxOpenConns(1)
-			sqlDB.SetMaxIdleConns(1)
-			sqlDB.SetConnMaxLifetime(0)
-		} else {
-			log.Printf("Failed to access underlying sql.DB for SQLite tuning: %v", dbErr)
+		if err := instance.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error; err != nil {
+			logger.Errorf("dbcore", "Failed to checkpoint SQLite WAL at startup: %v", err)
 		}
-		instance.Exec("PRAGMA wal = ON;")
-		if err := instance.Exec("PRAGMA journal_mode = WAL;").Error; err != nil {
-			log.Printf("Failed to enable WAL mode for SQLite: %v", err)
-		}
-		instance.Exec("PRAGMA synchronous = NORMAL;")
-		instance.Exec("PRAGMA busy_timeout = 5000;")
-		instance.Exec("PRAGMA cache_size = -65536;")
-		instance.Exec("PRAGMA temp_store = MEMORY;")
-		instance.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
 	default:
 		return fmt.Errorf("unsupported database type: %s (supported: %s)", flags.DatabaseType, flags.SupportedDatabaseTypes())
 	}
@@ -421,7 +443,7 @@ func doInitialize() error {
 	}
 	config.SetDb(instance)
 
-	// 配置库就绪后、执行后续 AutoMigrate 与一次性 metrics 迁移之前：
+	// 配置库就绪后、执行后续 AutoMigrate 之前：
 	// 基于配置中的版本标记检测升级并自动备份 ./data，便于回滚。
 	backupOnVersionUpgrade()
 
@@ -430,16 +452,15 @@ func doInitialize() error {
 	// 注意：负载/GPU/ping 历史监控数据运行期全部走 metric store（默认 SQLite
 	// ./data/metrics.db，或配置的 MySQL/PostgreSQL）。旧的 records /
 	// records_long_term / gpu_records / ping_records 表不再建表、不再写入。
-	// 若升级时旧表仍存在，会在 pkg/migrations.RunMetricStoreMigrations 中先导入再清理。
+	// 若升级时旧表仍存在，管理员可通过升级向导显式导入并清理。
 	// models.Record / models.PingRecord / models.GPURecord 结构体仍作为
 	// metric store 的读写 DTO 和旧表导入 DTO 保留在 models 包中。
+	// models.TrafficReportNotification 同样仅为旧数据库兼容保留，不再建表。
 
 	err = instance.AutoMigrate(
 		&models.User{},
 		&models.Client{},
 		&models.Log{},
-		&models.Clipboard{},
-		&models.LoadNotification{},
 		&models.OfflineNotification{},
 		&models.TrafficReportNotification{},
 		&models.TrafficResetReminder{},
@@ -449,6 +470,7 @@ func doInitialize() error {
 		&models.OidcProvider{},
 		&models.MessageSenderProvider{},
 		&models.ThemeConfiguration{},
+		&models.PluginConfiguration{},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create tables: %w", err)
@@ -456,13 +478,13 @@ func doInitialize() error {
 	if err := instance.AutoMigrate(
 		&models.Session{},
 	); err != nil {
-		log.Printf("Failed to create Session table, it may already exist: %v", err)
+		logger.Errorf("dbcore", "Failed to create Session table, it may already exist: %v", err)
 	}
 	if err := instance.AutoMigrate(
 		&models.Task{},
 		&models.TaskResult{},
 	); err != nil {
-		log.Printf("Failed to create Task and TaskResult table, it may already exist: %v", err)
+		logger.Errorf("dbcore", "Failed to create Task and TaskResult table, it may already exist: %v", err)
 	}
 
 	return nil

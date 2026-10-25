@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/database/accounts"
 	"github.com/komari-monitor/komari/database/clients"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/pkg/rpc"
 	"gorm.io/gorm"
 )
@@ -95,6 +95,7 @@ var publicPaths = []string{
 	"/api/recent",
 	"/api/admin",    // 由 RequireRole 处理
 	"/api/clients/", // 由 RequireRole 处理
+	"/api/preview/", // 预览令牌校验后放行
 }
 
 // PrivateSiteMiddleware 私有站点访问控制。

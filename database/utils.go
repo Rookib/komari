@@ -1,17 +1,19 @@
 package database
 
 import (
+	"context"
 	"encoding/json"
-	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/database/dbcore"
-	"github.com/komari-monitor/komari/database/metricstore"
 	"github.com/komari-monitor/komari/database/models"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
+	"github.com/komari-monitor/komari/internal/managedconfig"
+	"github.com/komari-monitor/komari/internal/metricstore"
+	logger "github.com/komari-monitor/komari/utils/log"
+	"github.com/komari-monitor/komari/web/public"
 )
 
 func GetPublicInfo() (map[string]interface{}, error) {
@@ -53,7 +55,7 @@ func GetPublicInfo() (map[string]interface{}, error) {
 			cst.Description = "Komari Monitor, a simple server monitoring tool."
 		}
 	}
-	metricCfg, err := config.GetManyAs[metricstore.MetricStoreConfig]()
+	retention, err := metricstore.GetRetentionSummary(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -66,59 +68,21 @@ func GetPublicInfo() (map[string]interface{}, error) {
 	tc_data := gin.H{}
 	err = json.Unmarshal([]byte(tc.Data), &tc_data)
 	if err != nil {
-		log.Printf("%v", err)
+		logger.Infof("database", "%v", err)
 	}
-	// Try to load theme declaration file and merge defaults for managed configuration
-	// Theme declarations live in ./data/theme/<short>/komari-theme.json
-	if cst.Theme != "" && cst.Theme != "default" {
-		themeConfigPath := filepath.Join("./data/theme", cst.Theme, "komari-theme.json")
-		if _, err := os.Stat(themeConfigPath); err == nil {
-			b, err := os.ReadFile(themeConfigPath)
-			if err == nil {
-				var themeDecl struct {
-					Configuration struct {
-						Type string                                 `json:"type"`
-						Data []models.ManagedThemeConfigurationItem `json:"data"`
-					} `json:"configuration"`
-				}
-				if err := json.Unmarshal(b, &themeDecl); err == nil {
-					if themeDecl.Configuration.Type == "managed" {
-						for _, item := range themeDecl.Configuration.Data {
-							if item.Key == "" {
-								continue
-							}
-							// missing
-							if _, exists := tc_data[item.Key]; !exists {
-								var def any = item.Default
-								// select
-								if item.Type == "select" {
-									if def == nil || def == "" {
-										if item.Options != "" {
-											opts := strings.Split(item.Options, ",")
-											if len(opts) > 0 {
-												def = strings.TrimSpace(opts[0])
-											}
-										}
-									}
-								}
-								// number->0, string->"", switch->false
-								if def == nil {
-									switch item.Type {
-									case "number":
-										def = 0
-									case "switch":
-										def = false
-									default:
-										def = ""
-									}
-								}
-								tc_data[item.Key] = def
-							}
-						}
-					}
-				}
+	items := themeConfigurationItems(cst.Theme)
+	if cst.Theme != "default" {
+		for _, item := range items {
+			if item.Key == "" {
+				continue
+			}
+			if _, exists := tc_data[item.Key]; !exists {
+				tc_data[item.Key] = managedconfig.DefaultValue(item)
 			}
 		}
+	}
+	if err := managedconfig.ResolveForOutput(tc_data, items); err != nil {
+		return nil, err
 	}
 
 	return gin.H{
@@ -130,12 +94,27 @@ func GetPublicInfo() (map[string]interface{}, error) {
 		"oauth_provider":            cst.OAuthProvider,
 		"disable_password_login":    cst.DisablePasswordLogin,
 		"cors_origin_check_enabled": cst.CorsOriginCheckEnabled,
-		"record_enabled":            metricCfg.RetentionDays > 0,  //兼容旧版本主题
-		"record_preserve_time":      metricCfg.RetentionDays * 24, //兼容旧版本主题
-		"ping_record_preserve_time": metricCfg.RetentionDays * 24, //兼容旧版本主题
-		"metric_retention_days":     metricCfg.RetentionDays,
+		"record_enabled":            retention.AllPositive, // 兼容旧版本主题
+		"record_preserve_time":      retention.MaxDays * 24,
+		"ping_record_preserve_time": retention.MaxDays * 24,
 		"private_site":              cst.PrivateSite,
 		"theme":                     cst.Theme,
 		"theme_settings":            tc_data,
 	}, nil
+}
+
+func themeConfigurationItems(short string) []models.ManagedThemeConfigurationItem {
+	var manifest models.Theme
+	if short == "default" {
+		data, err := public.PublicFS.ReadFile("defaultTheme/komari-theme.json")
+		if err != nil || json.Unmarshal(data, &manifest) != nil {
+			return nil
+		}
+	} else {
+		data, err := os.ReadFile(filepath.Join("./data/theme", short, "komari-theme.json"))
+		if err != nil || json.Unmarshal(data, &manifest) != nil {
+			return nil
+		}
+	}
+	return managedconfig.Items(manifest.Configuration)
 }

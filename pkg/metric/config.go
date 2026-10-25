@@ -33,10 +33,6 @@ type Config struct {
 	//
 	// TablePrefix 是 Store 管理的所有表名前缀。
 	TablePrefix string
-	// DefaultRetentionDays is used when a metric definition omits retention.
-	//
-	// DefaultRetentionDays 在指标定义未设置保留时间时使用。
-	DefaultRetentionDays int
 	// AutoMigrate controls whether Open creates or updates the schema.
 	//
 	// AutoMigrate 控制 Open 是否创建或更新表结构。
@@ -62,12 +58,10 @@ type Config struct {
 	// SQLite 保存 SQLite 专用选项。
 	SQLite SQLiteOptions
 
-	// RollupPolicy configures downsampling tiers and tiered retention. When it
-	// defines tiers, Store.Compact materializes them and enforces every
-	// retention window. The zero value disables rollups (raw points only).
+	// RollupPolicy configures downsampling tiers and tiered retention. Exact raw
+	// samples use the Store's fixed ten-minute in-memory window.
 	//
-	// RollupPolicy 配置降采样层级和分层保留时间；定义层级后，
-	// Store.Compact 会生成 rollup 并执行保留策略。零值表示禁用 rollup。
+	// RollupPolicy 配置降采样层级和分层保留时间。
 	RollupPolicy RollupPolicy
 }
 
@@ -103,6 +97,8 @@ type SQLiteOptions struct {
 	//
 	// WALAutoCheckpoint 设置 SQLite WAL 自动 checkpoint 页数。
 	WALAutoCheckpoint int
+	// JournalSizeLimitBytes caps the WAL retained after checkpoints.
+	JournalSizeLimitBytes int64
 	// ReadPoolSize, when > 0, opens a second read-only connection pool with
 	// this many connections for SELECT-style calls. SQLite serializes writes,
 	// but WAL lets readers run concurrently, so a read pool lifts read
@@ -151,22 +147,32 @@ type Option func(*Config)
 // DefaultConfig 返回指定后端的默认配置。
 func DefaultConfig(driver Driver, dsn string) Config {
 	return Config{
-		Driver:               driver,
-		DSN:                  dsn,
-		TablePrefix:          "metric_",
-		DefaultRetentionDays: 90,
-		AutoMigrate:          true,
-		MaxOpenConns:         25,
-		MaxIdleConns:         5,
-		ConnMaxLifetime:      time.Hour,
-		ConnectTimeout:       10 * time.Second,
+		Driver:          driver,
+		DSN:             dsn,
+		TablePrefix:     "metric_",
+		AutoMigrate:     true,
+		MaxOpenConns:    25,
+		MaxIdleConns:    5,
+		ConnMaxLifetime: time.Hour,
+		ConnectTimeout:  10 * time.Second,
 		SQLite: SQLiteOptions{
-			PerformanceProfile: SQLiteProfileBalanced,
-			BusyTimeout:        5 * time.Second,
-			CacheSizeKB:        64 * 1024,
-			TempStoreMemory:    true,
-			MMapSizeBytes:      256 * 1024 * 1024,
-			WALAutoCheckpoint:  1000,
+			PerformanceProfile:    SQLiteProfileBalanced,
+			BusyTimeout:           5 * time.Second,
+			CacheSizeKB:           4 * 1024,
+			TempStoreMemory:       false,
+			MMapSizeBytes:         0,
+			WALAutoCheckpoint:     4000,
+			JournalSizeLimitBytes: 4 * 1024 * 1024,
+		},
+		RollupPolicy: RollupPolicy{
+			RawRetention: 10 * time.Minute,
+			Tiers: []RollupTier{
+				{Interval: time.Minute, Retention: 600 * time.Minute},
+				{Interval: 5 * time.Minute, Retention: 600 * 5 * time.Minute},
+				{Interval: time.Hour, Retention: 600 * time.Hour},
+				{Interval: 24 * time.Hour, Retention: 100 * 365 * 24 * time.Hour},
+			},
+			Compression: 30,
 		},
 	}
 }
@@ -233,6 +239,10 @@ func SQLiteConfig(dsn string) Config {
 	// is honored instead of being mistaken for "unset".
 	cfg.MaxOpenConns = 1
 	cfg.MaxIdleConns = 1
+	// SQLite benefits from warm page caches. Unlike client/server backends,
+	// rotating its local file connections only adds churn, so the default keeps
+	// them until the Store closes. Callers can still set a lifetime explicitly.
+	cfg.ConnMaxLifetime = 0
 	return cfg
 }
 
@@ -265,15 +275,6 @@ func WithDB(db *sql.DB) Option {
 func WithTablePrefix(prefix string) Option {
 	return func(c *Config) {
 		c.TablePrefix = prefix
-	}
-}
-
-// WithDefaultRetention sets the default metric retention in days.
-//
-// WithDefaultRetention 设置指标默认保留天数。
-func WithDefaultRetention(days int) Option {
-	return func(c *Config) {
-		c.DefaultRetentionDays = days
 	}
 }
 
@@ -385,6 +386,13 @@ func WithSQLiteWALAutoCheckpoint(pages int) Option {
 	}
 }
 
+// WithSQLiteJournalSizeLimit sets the WAL bytes retained after checkpoints.
+func WithSQLiteJournalSizeLimit(bytes int64) Option {
+	return func(c *Config) {
+		c.SQLite.JournalSizeLimitBytes = bytes
+	}
+}
+
 // WithSQLiteReadPool enables a dedicated read-only connection pool of n
 // connections for SQLite. Writes stay on the single primary connection
 // (SQLite serializes them); reads fan out across the pool, which WAL mode
@@ -401,10 +409,10 @@ func WithSQLiteReadPool(n int) Option {
 
 // WithRollupPolicy sets the downsampling/retention ladder. Compact uses it to
 // build rollup tiers (each progressively coarser and longer-lived) and to age
-// out raw points and expired tiers.
+// out expired summary tiers.
 //
 // WithRollupPolicy 设置降采样与保留时间阶梯；Compact 会据此构建逐级
-// 更粗、保留更久的 rollup，并清理过期原始点和过期层级。
+// 更粗、保留更久的 rollup，并清理过期层级。
 func WithRollupPolicy(p RollupPolicy) Option {
 	return func(c *Config) {
 		c.RollupPolicy = p
@@ -442,8 +450,17 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%w: table prefix must contain only letters, digits, and underscores", ErrInvalidArgument)
 		}
 	}
-	if c.DefaultRetentionDays <= 0 {
-		return fmt.Errorf("%w: default retention days must be positive", ErrInvalidArgument)
+	// Bound generated index names to the backend identifier limit. Restructure
+	// performs the stricter check required by its temporary "rebuild_" prefix.
+	switch c.Driver {
+	case DriverMySQL:
+		if len(c.TablePrefix) > 35 {
+			return fmt.Errorf("%w: table prefix is too long for MySQL identifiers", ErrInvalidArgument)
+		}
+	case DriverPostgreSQL:
+		if len(c.TablePrefix) > 34 {
+			return fmt.Errorf("%w: table prefix is too long for PostgreSQL identifiers", ErrInvalidArgument)
+		}
 	}
 	if err := c.RollupPolicy.Validate(); err != nil {
 		return err

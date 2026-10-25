@@ -77,7 +77,7 @@ const (
 	// defaultTDigestCompression is used when a caller supplies no useful value.
 	//
 	// defaultTDigestCompression 在调用方未提供有效值时使用。
-	defaultTDigestCompression = 100.0
+	defaultTDigestCompression = 30.0
 	// tdigestMagic0 is the first magic byte in the binary format.
 	//
 	// tdigestMagic0 是二进制格式的第一个 magic 字节。
@@ -93,12 +93,12 @@ const (
 )
 
 // NewTDigest returns an empty digest. compression trades size for accuracy;
-// higher keeps more centroids. Values <= 1 fall back to the default (100),
+// higher keeps more centroids. Values <= 1 fall back to the default (30),
 // which keeps each digest to a few KB while holding tail error to well under
 // 1% for typical distributions.
 //
 // NewTDigest 返回一个空 digest。compression 在大小和精度之间取舍；值越高会保留
-// 更多质心。小于等于 1 的值会回退到默认值（100），这通常能把每个 digest 控制在
+// 更多质心。小于等于 1 的值会回退到默认值（30），这通常能把每个 digest 控制在
 // 几 KB，同时让典型分布的尾部误差远低于 1%。
 func NewTDigest(compression float64) *TDigest {
 	if compression <= 1 {
@@ -110,6 +110,15 @@ func NewTDigest(compression float64) *TDigest {
 		max:         math.Inf(-1),
 		processed:   true,
 	}
+}
+
+func (t *TDigest) clone() *TDigest {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	cloned.centroids = append([]centroid(nil), t.centroids...)
+	return &cloned
 }
 
 // Add folds a single observation with weight w (w must be > 0) into the digest.
@@ -130,9 +139,13 @@ func (t *TDigest) Add(x, w float64) {
 	t.processed = false
 	// Bound the unprocessed buffer so a long stream cannot grow memory without
 	// limit; process() collapses it back to ~compression centroids.
-	if len(t.centroids) > int(8*t.compression)+16 {
+	if len(t.centroids) > t.processThreshold() {
 		t.process()
 	}
+}
+
+func (t *TDigest) processThreshold() int {
+	return int(8*t.compression) + 16
 }
 
 // Merge folds every centroid of other into t. This is the operation rollup
@@ -145,10 +158,7 @@ func (t *TDigest) Merge(other *TDigest) {
 	if other == nil || other.count == 0 {
 		return
 	}
-	other.process()
-	for _, c := range other.centroids {
-		t.centroids = append(t.centroids, c)
-	}
+	t.centroids = append(t.centroids, other.centroids...)
 	t.count += other.count
 	if other.min < t.min {
 		t.min = other.min
@@ -157,7 +167,9 @@ func (t *TDigest) Merge(other *TDigest) {
 		t.max = other.max
 	}
 	t.processed = false
-	t.process()
+	if len(t.centroids) > t.processThreshold() {
+		t.process()
+	}
 }
 
 // Count returns the total weight observed.
@@ -185,7 +197,7 @@ func (t *TDigest) process() {
 		return t.centroids[i].mean < t.centroids[j].mean
 	})
 	total := t.count
-	merged := t.centroids[:0:0] // fresh backing array; don't alias input mid-merge
+	merged := t.centroids[:0]
 	cur := t.centroids[0]
 	weightBefore := 0.0
 	for i := 1; i < len(t.centroids); i++ {
@@ -297,6 +309,11 @@ func DecodeTDigest(b []byte) (*TDigest, error) {
 	if len(b) == 0 {
 		return NewTDigest(defaultTDigestCompression), nil
 	}
+	decoded, err := decodeStoredTDigest(b)
+	if err != nil {
+		return nil, err
+	}
+	b = decoded
 	if len(b) < 3+8*4+4 || b[0] != tdigestMagic0 || b[1] != tdigestMagic1 {
 		return nil, errors.New("metric: invalid t-digest blob")
 	}

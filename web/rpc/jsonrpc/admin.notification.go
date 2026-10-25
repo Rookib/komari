@@ -2,25 +2,29 @@ package jsonrpc
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
 
+	"github.com/komari-monitor/komari/database"
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
 	"github.com/komari-monitor/komari/database/notification"
 	"github.com/komari-monitor/komari/database/sshlogin"
 	"github.com/komari-monitor/komari/pkg/rpc"
+	"github.com/komari-monitor/komari/utils/messageSender"
+	"github.com/komari-monitor/komari/utils/telegrambot"
 	"gorm.io/gorm/clause"
 )
 
 // admin.notification.go
-// 通知相关 RPC2 方法（admin 命名空间）：负载告警、离线通知、流量报告。
+// 通知相关 RPC2 方法（admin 命名空间）：离线通知、发送通知。
 
 func init() {
-	// load notifications
-	reg("addLoadNotification", adminAddLoadNotification, "Create a load notification")
-	reg("deleteLoadNotification", adminDeleteLoadNotification, "Delete load notifications by ids")
-	reg("editLoadNotification", adminEditLoadNotification, "Edit load notifications")
-	reg("getAllLoadNotifications", adminGetAllLoadNotifications, "List all load notifications")
+	reg("listNotificationChannels", adminListNotificationChannels, "List notification channels")
+	reg("getNotificationChannelConfiguration", adminGetNotificationChannelConfiguration, "Get notification channel configuration")
+	reg("setNotificationChannelConfiguration", adminSetNotificationChannelConfiguration, "Set notification channel configuration")
 	// offline notifications
 	reg("listOfflineNotifications", adminListOfflineNotifications, "List offline notifications")
 	reg("editOfflineNotification", adminEditOfflineNotification, "Edit offline notifications")
@@ -38,72 +42,86 @@ func init() {
 	reg("disableSSHLoginNotifications", adminDisableSSHLoginNotifications, "Disable SSH login notifications")
 	reg("listSSHLoginEvents", adminListSSHLoginEvents, "List SSH login events")
 	reg("deleteSSHLoginEvents", adminDeleteSSHLoginEvents, "Delete SSH login events")
+	// send notification
+	reg("sendNotification", adminSendNotification, "Send a notification")
+}
+
+func adminListNotificationChannels(_ context.Context, _ *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
+	return messageSender.ListNotificationChannels(), nil
+}
+
+func adminGetNotificationChannelConfiguration(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
+	var params struct {
+		ID string `json:"id"`
+	}
+	if err := req.BindParams(&params); err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid request data: "+err.Error(), nil)
+	}
+	configuration, values, exists, err := messageSender.GetNotificationChannelConfiguration(params.ID)
+	if err != nil {
+		return nil, rpc.MakeError(rpc.InternalError, "Failed to load notification channel configuration: "+err.Error(), nil)
+	}
+	if !exists {
+		return nil, rpc.MakeError(rpc.NotFound, "Notification channel not found: "+params.ID, nil)
+	}
+	return map[string]any{
+		"configuration": configuration,
+		"data":          values,
+	}, nil
+}
+
+func adminSetNotificationChannelConfiguration(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
+	var params struct {
+		ID   string         `json:"id"`
+		Data map[string]any `json:"data"`
+	}
+	if err := req.BindParams(&params); err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid request data: "+err.Error(), nil)
+	}
+	params.ID = strings.TrimSpace(params.ID)
+	if !messageSender.NotificationChannelRegistered(params.ID) {
+		return nil, rpc.MakeError(rpc.NotFound, "Notification channel not found: "+params.ID, nil)
+	}
+	if params.Data == nil {
+		params.Data = map[string]any{}
+	}
+	addition, err := json.Marshal(params.Data)
+	if err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid notification channel configuration: "+err.Error(), nil)
+	}
+	if err := database.SaveMessageSenderConfig(&models.MessageSenderProvider{
+		Name:     params.ID,
+		Addition: string(addition),
+	}); err != nil {
+		return nil, rpc.MakeError(rpc.InternalError, "Failed to save notification channel configuration: "+err.Error(), nil)
+	}
+	if params.ID == "telegram" {
+		telegrambot.Reload()
+	}
+	return nil, nil
+}
+
+// adminSendNotification 发送一条通知。仅供外部（插件/脚本）通过 RPC 调用，
+// 内部通知逻辑（notifier/renewal/session 等）直接调用 messageSender.SendNotification。
+func adminSendNotification(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
+	var params struct {
+		Event models.EventMessage `json:"event"`
+	}
+	if err := req.BindParams(&params); err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid request data: "+err.Error(), nil)
+	}
+	if fmt.Sprint(params.Event.Event) == "" {
+		return nil, rpc.MakeError(rpc.InvalidParams, "event is required", nil)
+	}
+	if err := messageSender.SendNotification(params.Event); err != nil {
+		return nil, rpc.MakeError(rpc.InternalError, "Failed to send notification: "+err.Error(), nil)
+	}
+	return nil, nil
 }
 
 // reg 是 admin 命名空间方法的注册便捷封装。
 func reg(name string, h rpc.Handler, summary string) {
 	RegisterWithGroupAndMeta(name, rpc.RoleAdmin, h, &rpc.MethodMeta{Name: "admin:" + name, Summary: summary})
-}
-
-func adminAddLoadNotification(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
-	var params struct {
-		Clients   []string `json:"clients"`
-		Name      string   `json:"name"`
-		Metric    string   `json:"metric"`
-		Threshold float32  `json:"threshold"`
-		Ratio     float32  `json:"ratio"`
-		Interval  int      `json:"interval"`
-	}
-	req.BindParams(&params)
-	if len(params.Clients) == 0 || params.Metric == "" || params.Threshold == 0 || params.Ratio == 0 || params.Interval == 0 {
-		return nil, rpc.MakeError(rpc.InvalidParams, "clients, metric, threshold, ratio and interval are required", nil)
-	}
-	if params.Interval > 4*60 || params.Interval <= 0 {
-		return nil, rpc.MakeError(rpc.InvalidParams, "Interval must be between 1 and 240 minutes", nil)
-	}
-	if params.Ratio <= 0 || params.Ratio > 1 {
-		return nil, rpc.MakeError(rpc.InvalidParams, "Ratio must be between 0 and 1", nil)
-	}
-	taskID, err := notification.AddLoadNotification(params.Clients, params.Name, params.Metric, params.Threshold, params.Ratio, params.Interval)
-	if err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, err.Error(), nil)
-	}
-	return map[string]any{"task_id": taskID}, nil
-}
-
-func adminDeleteLoadNotification(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
-	var params struct {
-		ID []uint `json:"id"`
-	}
-	req.BindParams(&params)
-	if len(params.ID) == 0 {
-		return nil, rpc.MakeError(rpc.InvalidParams, "id is required", nil)
-	}
-	if err := notification.DeleteLoadNotification(params.ID); err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, err.Error(), nil)
-	}
-	return nil, nil
-}
-
-func adminEditLoadNotification(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
-	var params struct {
-		Notifications []*models.LoadNotification `json:"notifications"`
-	}
-	if err := req.BindParams(&params); err != nil {
-		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid request data", nil)
-	}
-	if err := notification.EditLoadNotification(params.Notifications); err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, err.Error(), nil)
-	}
-	return nil, nil
-}
-
-func adminGetAllLoadNotifications(_ context.Context, _ *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
-	list, err := notification.GetAllLoadNotifications()
-	if err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, err.Error(), nil)
-	}
-	return list, nil
 }
 
 func adminListOfflineNotifications(_ context.Context, _ *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
@@ -271,7 +289,9 @@ func adminListSSHLoginEvents(_ context.Context, req *rpc.JsonRpcRequest) (any, *
 		Client string `json:"client"`
 		Limit  string `json:"limit"`
 	}
-	_ = req.BindParams(&params)
+	if err := req.BindParams(&params); err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid request data", nil)
+	}
 	limit := 100
 	if params.Limit != "" {
 		parsed, err := strconv.Atoi(params.Limit)
@@ -291,7 +311,9 @@ func adminDeleteSSHLoginEvents(_ context.Context, req *rpc.JsonRpcRequest) (any,
 	var params struct {
 		Client string `json:"client"`
 	}
-	_ = req.BindParams(&params)
+	if err := req.BindParams(&params); err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid request data", nil)
+	}
 	if err := sshlogin.DeleteEvents(params.Client); err != nil {
 		return nil, rpc.MakeError(rpc.InternalError, "Failed to delete SSH login events: "+err.Error(), nil)
 	}

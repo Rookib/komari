@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -20,9 +21,9 @@ import (
 	"time"
 	_ "time/tzdata"
 
-	"github.com/komari-monitor/komari/database"
 	"github.com/komari-monitor/komari/database/clients"
 	"github.com/komari-monitor/komari/database/models"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/utils/messageSender"
 	telegramprovider "github.com/komari-monitor/komari/utils/messageSender/telegram"
 	"github.com/komari-monitor/komari/utils/notifier"
@@ -101,20 +102,21 @@ type inlineKeyboard struct {
 // Reload stops the existing poller and starts one matching the active Telegram
 // provider configuration. Calling Reload repeatedly with unchanged settings is safe.
 func Reload() {
-	if !messageSender.IsProviderConfigured("telegram") {
+	enabled, err := config.GetAs[bool](config.NotificationEnabledKey, false)
+	if err != nil || !enabled || !messageSender.IsProviderConfigured("telegram") {
 		stopIfRunning()
 		return
 	}
 
-	provider, err := database.GetMessageSenderConfigByName("telegram")
-	if err != nil {
-		log.Printf("Telegram command menu disabled: cannot load provider: %v", err)
+	_, values, exists, err := messageSender.GetNotificationChannelConfiguration("telegram")
+	if err != nil || !exists {
+		log.Print("Telegram command menu disabled: cannot load configuration")
 		stopIfRunning()
 		return
 	}
 	var addition telegramprovider.Addition
-	if err := json.Unmarshal([]byte(provider.Addition), &addition); err != nil {
-		log.Printf("Telegram command menu disabled: invalid provider configuration: %v", err)
+	if err := messageSender.DecodeConfiguration(values, &addition); err != nil {
+		log.Print("Telegram command menu disabled: invalid configuration")
 		stopIfRunning()
 		return
 	}
@@ -197,13 +199,17 @@ func newBot(addition telegramprovider.Addition) (*bot, error) {
 	if endpoint == "" {
 		endpoint = defaultEndpoint
 	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("Telegram endpoint must be an HTTPS URL without credentials, query or fragment")
+	}
 	return &bot{
 		baseURL:         endpoint + addition.BotToken,
 		chatID:          chatID,
 		threadID:        threadID,
 		allowedUsers:    allowed,
 		location:        location,
-		client:          &http.Client{Timeout: 40 * time.Second},
+		client:          &http.Client{Timeout: 40 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		commandTimezone: tz,
 	}, nil
 }
@@ -509,28 +515,29 @@ func (b *bot) answerCallback(ctx context.Context, id string) error {
 func (b *bot) call(ctx context.Context, method string, values url.Values, output any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.baseURL+"/"+method, strings.NewReader(values.Encode()))
 	if err != nil {
-		return err
+		return errors.New("Telegram request failed")
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return errors.New("Telegram request failed")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Telegram API %s returned HTTP %d", method, resp.StatusCode)
-	}
+
 	var raw json.RawMessage
 	result := apiResponse[json.RawMessage]{Result: raw}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&result); err != nil {
+		return errors.New("Telegram request failed")
 	}
-	if !result.OK {
-		return fmt.Errorf("Telegram API %s failed: %s", method, result.Description)
+	if !result.OK || resp.StatusCode != http.StatusOK {
+		if method == "editMessageText" && strings.Contains(strings.ToLower(result.Description), "message is not modified") {
+			return errors.New("message is not modified")
+		}
+		return fmt.Errorf("Telegram API %s failed (HTTP %d)", method, resp.StatusCode)
 	}
 	if output != nil && len(result.Result) > 0 && string(result.Result) != "true" {
 		if err := json.Unmarshal(result.Result, output); err != nil {
-			return err
+			return errors.New("Telegram request failed")
 		}
 	}
 	return nil

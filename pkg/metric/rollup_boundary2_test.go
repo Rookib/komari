@@ -29,7 +29,7 @@ func TestSeriesHybridKeepsUncompactedRawNearCutoff(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "nearcut", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "nearcut", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	now := time.Date(2026, 6, 18, 12, 0, 30, 0, time.UTC)
@@ -94,7 +94,7 @@ func TestSeriesHybridEndEqualsCutoff(t *testing.T) {
 		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
 	}
 	s := newRollupStore(t, policy)
-	if err := s.CreateMetric(ctx, Definition{Name: "endcut", Type: TypeGauge}); err != nil {
+	if err := s.CreateMetric(ctx, Definition{Name: "endcut", Type: TypeGauge, RetentionDays: 30}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
@@ -131,5 +131,43 @@ func TestSeriesHybridEndEqualsCutoff(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected 11:00 bucket including the cutoff raw point: %#v", got)
+	}
+}
+
+// TestSeriesIncludesLateMinuteRollup verifies that a late point is merged into
+// the persisted minute and remains visible without a raw/rollup split.
+func TestSeriesIncludesLateMinuteRollup(t *testing.T) {
+	ctx := context.Background()
+	policy := RollupPolicy{
+		RawRetention: 30 * time.Minute,
+		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
+	}
+	s := newRollupStore(t, policy)
+	if err := s.CreateMetric(ctx, Definition{Name: "watermark", Type: TypeGauge, RetentionDays: 30}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	compactAt := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+	if err := s.WriteBatch(ctx, []Point{
+		{MetricName: "watermark", EntityID: "n1", Timestamp: time.Date(2026, 6, 18, 11, 20, 0, 0, time.UTC), Value: 10},
+		{MetricName: "watermark", EntityID: "n1", Timestamp: time.Date(2026, 6, 18, 11, 32, 0, 0, time.UTC), Value: 100},
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := s.Compact(ctx, compactAt); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	queryAt := compactAt.Add(4 * time.Minute)
+	got, err := s.Series(ctx, AggregateQuery{
+		Query:       Query{MetricName: "watermark", EntityID: "n1", Start: time.Date(2026, 6, 18, 11, 0, 0, 0, time.UTC), End: queryAt},
+		Aggregation: AggCount,
+		Interval:    time.Hour,
+	}, queryAt)
+	if err != nil {
+		t.Fatalf("series: %v", err)
+	}
+	if len(got) != 1 || got[0].Count != 2 {
+		t.Fatalf("series should include both minute summaries, got %#v", got)
 	}
 }

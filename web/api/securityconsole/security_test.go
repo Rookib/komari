@@ -27,7 +27,7 @@ func TestAttackFromOldAuditLog(t *testing.T) {
 	entry := models.Log{
 		ID:      1,
 		Message: "SSH auth guard alert: client=腾讯云 上海四区, ip=51.91.64.198, user=root, count=5",
-		Time:    models.FromTime(time.Date(2026, 6, 24, 14, 7, 50, 0, time.UTC)),
+		Time:    time.Date(2026, 6, 24, 14, 7, 50, 0, time.UTC),
 	}
 
 	attack, ok := attackFromLog(entry, clientResolver{}, map[string]IPState{})
@@ -46,7 +46,7 @@ func TestAttackFromNewAuditLog(t *testing.T) {
 	entry := models.Log{
 		ID:      2,
 		Message: "SSH auth guard alert: client=DMIT LAX, uuid=client-1, ip=203.0.113.9, user=root,ubuntu, method=password,pam, count=21",
-		Time:    models.FromTime(time.Date(2026, 6, 24, 14, 8, 1, 0, time.UTC)),
+		Time:    time.Date(2026, 6, 24, 14, 8, 1, 0, time.UTC),
 	}
 
 	attack, ok := attackFromLog(entry, clientResolver{}, map[string]IPState{
@@ -70,7 +70,7 @@ func TestSuppressedEventFromLog(t *testing.T) {
 	entry := models.Log{
 		ID:      3,
 		Message: "SSH auth guard alert suppressed: client=RackNerd uuid=client-2 ip=198.51.100.7 reason=cooldown",
-		Time:    models.FromTime(time.Date(2026, 6, 24, 14, 9, 0, 0, time.UTC)),
+		Time:    time.Date(2026, 6, 24, 14, 9, 0, 0, time.UTC),
 	}
 
 	event, ok := eventFromLog(entry, clientResolver{}, map[string]IPState{})

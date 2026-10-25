@@ -1,18 +1,20 @@
 package agent
 
 import (
+	"sort"
 	"sync"
 	"time"
 
-	v1 "github.com/komari-monitor/komari/protocol/v1"
+	v2 "github.com/komari-monitor/komari/protocol/v2"
 	"github.com/komari-monitor/komari/web/connection"
 )
 
 var (
-	connectedClients  = make(map[string]*connection.SafeConn)
-	connectedClientV2 = make(map[string]bool)
-	latestReport      = make(map[string]*v1.Report)
-	// presenceOnly stores online state for non-WebSocket agents (e.g., Nezha gRPC)
+	connectedClients = make(map[string]*connection.SafeConn)
+	v2Clients        = make(map[string]struct{})
+	latestReport     = make(map[string]*v2.Report)
+	recentReports    = make(map[string][]v2.Report)
+	// presenceOnly stores online state for non-WebSocket agents.
 	// value keeps connectionID and a soft expiration to avoid flicker
 	presenceOnly = make(map[string]struct {
 		id     int64
@@ -20,6 +22,8 @@ var (
 	})
 	mu = sync.RWMutex{}
 )
+
+const recentReportRetention = time.Minute
 
 func GetConnectedClients() map[string]*connection.SafeConn {
 	mu.RLock()
@@ -37,16 +41,17 @@ func SetConnectedClients(uuid string, conn *connection.SafeConn) {
 	connectedClients[uuid] = conn
 }
 
-func SetClientProtocolVersion(uuid string, version int) {
+func MarkV2Client(uuid string) {
 	mu.Lock()
 	defer mu.Unlock()
-	connectedClientV2[uuid] = version >= 2
+	v2Clients[uuid] = struct{}{}
 }
 
 func IsV2Client(uuid string) bool {
 	mu.RLock()
 	defer mu.RUnlock()
-	return connectedClientV2[uuid]
+	_, ok := v2Clients[uuid]
+	return ok
 }
 
 func DeleteClientConditionally(uuid string, connToRemove *connection.SafeConn) {
@@ -56,7 +61,7 @@ func DeleteClientConditionally(uuid string, connToRemove *connection.SafeConn) {
 	// 检查当前 map 里的 conn 是否就是要删除的这一个
 	if currentConn, exists := connectedClients[uuid]; exists && currentConn == connToRemove {
 		delete(connectedClients, uuid)
-		delete(connectedClientV2, uuid)
+		delete(v2Clients, uuid)
 	}
 }
 func DeleteConnectedClients(uuid string) {
@@ -64,7 +69,7 @@ func DeleteConnectedClients(uuid string) {
 	defer mu.Unlock()
 	// 只从 map 中删除，不再负责关闭连接
 	delete(connectedClients, uuid)
-	delete(connectedClientV2, uuid)
+	delete(v2Clients, uuid)
 }
 
 // SetPresence sets or clears presence for non-WebSocket agents.
@@ -117,22 +122,77 @@ func GetAllOnlineUUIDs() []string {
 	}
 	return res
 }
-func GetLatestReport() map[string]*v1.Report {
+func GetLatestReport() map[string]*v2.Report {
 	mu.RLock()
 	defer mu.RUnlock()
-	reportCopy := make(map[string]*v1.Report)
+	reportCopy := make(map[string]*v2.Report)
 	for k, v := range latestReport {
-		reportCopy[k] = v
+		if v == nil {
+			continue
+		}
+		item := *v
+		reportCopy[k] = &item
 	}
 	return reportCopy
 }
-func SetLatestReport(uuid string, report *v1.Report) {
+
+// RecordReport updates the latest runtime state and keeps only the short raw
+// window used by recent-status compatibility endpoints.
+func RecordReport(report v2.Report) {
+	if report.UUID == "" {
+		return
+	}
+	if report.UpdatedAt.IsZero() {
+		report.UpdatedAt = time.Now().UTC()
+	} else {
+		report.UpdatedAt = report.UpdatedAt.UTC()
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	latestReport[uuid] = report
+	if latest := latestReport[report.UUID]; latest == nil || !report.UpdatedAt.Before(latest.UpdatedAt) {
+		item := report
+		latestReport[report.UUID] = &item
+	}
+	cutoff := time.Now().UTC().Add(-recentReportRetention)
+	reports := reportsAfter(recentReports[report.UUID], cutoff)
+	if report.UpdatedAt.Before(cutoff) {
+		recentReports[report.UUID] = reports
+		return
+	}
+	insertAt := sort.Search(len(reports), func(i int) bool {
+		return reports[i].UpdatedAt.After(report.UpdatedAt)
+	})
+	reports = append(reports, v2.Report{})
+	copy(reports[insertAt+1:], reports[insertAt:])
+	reports[insertAt] = report
+	recentReports[report.UUID] = reports
 }
+
+func GetRecentReports(uuid string) []v2.Report {
+	mu.Lock()
+	defer mu.Unlock()
+	reports := reportsAfter(recentReports[uuid], time.Now().UTC().Add(-recentReportRetention))
+	if len(reports) == 0 {
+		delete(recentReports, uuid)
+		return []v2.Report{}
+	}
+	recentReports[uuid] = reports
+	return append([]v2.Report(nil), reports...)
+}
+
+func reportsAfter(reports []v2.Report, cutoff time.Time) []v2.Report {
+	first := 0
+	for first < len(reports) && reports[first].UpdatedAt.Before(cutoff) {
+		first++
+	}
+	out := make([]v2.Report, len(reports)-first)
+	copy(out, reports[first:])
+	return out
+}
+
 func DeleteLatestReport(uuid string) {
 	mu.Lock()
 	defer mu.Unlock()
 	delete(latestReport, uuid)
+	delete(recentReports, uuid)
 }

@@ -7,10 +7,8 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari/database/clients"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/utils/geoip"
-
-	"github.com/gin-gonic/gin"
 )
 
 func getClientIPType(ip net.IP) int {
@@ -26,6 +24,9 @@ func getClientIPType(ip net.IP) int {
 }
 
 func saveClientBasicInfo(info map[string]interface{}, uuid string, fallbackIP string) error {
+	// Only agent-owned telemetry fields may be updated. Account tokens, billing,
+	// visibility and server-maintained vnStat anchors are administrator-owned.
+	info = filterAgentBasicInfo(info)
 	info["uuid"] = uuid
 	if _, reported := info["traffic_reset_day"]; reported {
 		info["traffic_reset_reported"] = true
@@ -102,24 +103,16 @@ func appendClientRegionFromGeoIP(info map[string]interface{}) {
 	}
 }
 
-func UploadBasicInfo(c *gin.Context) {
-	var cbi = map[string]interface{}{}
-	if err := c.ShouldBindJSON(&cbi); err != nil {
-		c.JSON(400, gin.H{"status": "error", "error": "Invalid or missing data"})
-		return
+func filterAgentBasicInfo(info map[string]interface{}) map[string]interface{} {
+	allowed := []string{"cpu_name", "virtualization", "arch", "cpu_cores", "cpu_physical_cores",
+		"os", "kernel_version", "gpu_name", "ipv4", "ipv6", "mem_total", "swap_total", "disk_total", "version",
+		"traffic_reset_day", "traffic_reset_timezone", "vnstat_available", "vnstat_interface",
+		"vnstat_total_up", "vnstat_total_down", "vnstat_days", "vnstat_updated_at"}
+	filtered := make(map[string]interface{}, len(allowed))
+	for _, key := range allowed {
+		if value, ok := info[key]; ok {
+			filtered[key] = value
+		}
 	}
-
-	token := c.Query("token")
-	uuid, err := clients.GetClientUUIDByToken(token)
-	if uuid == "" || err != nil {
-		c.JSON(400, gin.H{"status": "error", "error": "Invalid token"})
-		return
-	}
-
-	if err := ingestBasicInfo(uuid, cbi, c.ClientIP()); err != nil {
-		c.JSON(500, gin.H{"status": "error", "error": err})
-		return
-	}
-
-	c.JSON(200, gin.H{"status": "success"})
+	return filtered
 }

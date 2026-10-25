@@ -16,7 +16,7 @@ import (
 	"github.com/komari-monitor/komari/database/models"
 	"github.com/komari-monitor/komari/database/securityactions"
 	"github.com/komari-monitor/komari/database/sshlogin"
-	"github.com/komari-monitor/komari/pkg/config"
+	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/web/api"
 )
 
@@ -315,7 +315,7 @@ func attackFromLog(logEntry models.Log, resolver clientResolver, states map[stri
 		Client:      clientName,
 		ClientUUID:  clientUUID,
 		Method:      method,
-		Timestamp:   logEntry.Time.ToTime().Format(time.RFC3339),
+		Timestamp:   logEntry.Time.Format(time.RFC3339),
 		Status:      status,
 		Risk:        riskLevel(failedCount, status),
 	}, true
@@ -351,7 +351,7 @@ func eventFromLog(logEntry models.Log, resolver clientResolver, states map[strin
 			SourceIP:   sourceIP,
 			Client:     clientName,
 			ClientUUID: clientUUID,
-			Timestamp:  logEntry.Time.ToTime().Format(time.RFC3339),
+			Timestamp:  logEntry.Time.Format(time.RFC3339),
 			Status:     resolveIPStatus(clientUUID, sourceIP, states),
 			Message:    logEntry.Message,
 		}, true
@@ -362,7 +362,7 @@ func eventFromLog(logEntry models.Log, resolver clientResolver, states map[strin
 			return SecurityEvent{
 				ID:        logEntry.ID,
 				Type:      eventName,
-				Timestamp: logEntry.Time.ToTime().Format(time.RFC3339),
+				Timestamp: logEntry.Time.Format(time.RFC3339),
 				Status:    "active",
 				Risk:      eventRisk(eventName),
 				Message:   logEntry.Message,
@@ -375,7 +375,7 @@ func eventFromLog(logEntry models.Log, resolver clientResolver, states map[strin
 			return SecurityEvent{
 				ID:        logEntry.ID,
 				Type:      eventName + "SendFailed",
-				Timestamp: logEntry.Time.ToTime().Format(time.RFC3339),
+				Timestamp: logEntry.Time.Format(time.RFC3339),
 				Status:    "active",
 				Risk:      "medium",
 				Message:   logEntry.Message,

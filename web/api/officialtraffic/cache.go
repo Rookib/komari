@@ -71,7 +71,7 @@ func maybeNotifyVerification(payload officialtraffic.CollectorUpdate) {
 	}
 	verificationNotice.Store(uuid, now)
 
-	client, err := clients.GetClientBasicInfo(uuid)
+	client, err := clients.GetClientByUUID(uuid)
 	name := uuid
 	if err == nil && strings.TrimSpace(client.Name) != "" {
 		name = strings.TrimSpace(client.Name)

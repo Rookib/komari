@@ -49,8 +49,28 @@ func TestRestructureRebuildsLegacyPointsIntoNormalizedSchema(t *testing.T) {
 	if err != nil || !needs {
 		t.Fatalf("needs restructure = %v, %v", needs, err)
 	}
-	if _, err := s.Restructure(ctx, nil); err != nil {
+	var phases []string
+	if _, err := s.Restructure(ctx, func(progress RestructureProgress) {
+		if len(phases) == 0 || phases[len(phases)-1] != progress.Phase {
+			phases = append(phases, progress.Phase)
+		}
+		if progress.Phase != "copying" && (progress.Current != "" || progress.RowsDone != progress.RowsTotal) {
+			t.Fatalf("unexpected post-copy progress: %#v", progress)
+		}
+		if progress.Phase == "daily_rollups" {
+			for _, suffix := range []string{"series", "label_sets", "resolutions", "rollups"} {
+				var count int
+				table := s.cfg.TablePrefix + "rebuild_" + suffix
+				if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = ?", table).Scan(&count); err != nil || count == 0 {
+					t.Fatalf("missing shadow statistics before daily rebuild for %s: count=%d err=%v", table, count, err)
+				}
+			}
+		}
+	}); err != nil {
 		t.Fatalf("restructure: %v", err)
+	}
+	if got, want := strings.Join(phases, ","), "copying,preparing_statistics,daily_rollups,compacting,validating,switching,completed"; got != want {
+		t.Fatalf("progress phases = %s, want %s", got, want)
 	}
 	var labelsHash string
 	if err := s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT labels_hash FROM %s LIMIT 1", s.tables.labels)).Scan(&labelsHash); err != nil {

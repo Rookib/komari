@@ -14,7 +14,8 @@ const (
 	restructureRollupWriteBatchSize = 500
 )
 
-// RestructureProgress is emitted after each bounded import batch.
+// RestructureProgress is emitted after each bounded import batch and before
+// the post-copy preparation, aggregation, compaction and validation stages.
 type RestructureProgress struct {
 	Phase        string
 	Current      string
@@ -451,12 +452,28 @@ func (s *Store) Restructure(ctx context.Context, report func(RestructureProgress
 	if err := shadow.flushAllHotRollups(ctx); err != nil {
 		return RestructureResult{}, err
 	}
+	reportPhase := func(phase string) {
+		progress.Phase = phase
+		progress.Current = ""
+		if report != nil {
+			report(progress)
+		}
+	}
+	if shadow.cfg.Driver == DriverSQLite {
+		reportPhase("preparing_statistics")
+		if err := shadow.prepareRestructureStatistics(ctx); err != nil {
+			return RestructureResult{}, fmt.Errorf("prepare rebuild statistics: %w", err)
+		}
+	}
+	reportPhase("daily_rollups")
 	if err := shadow.rebuildDailyRollups(ctx); err != nil {
 		return RestructureResult{}, err
 	}
+	reportPhase("compacting")
 	if _, err := shadow.Compact(ctx, time.Now().UTC()); err != nil {
 		return RestructureResult{}, err
 	}
+	reportPhase("validating")
 	if err := shadow.validateNormalizedRestructure(ctx, len(definitions)); err != nil {
 		return RestructureResult{}, fmt.Errorf("validate rebuild schema before switch: %w", err)
 	}
@@ -1319,6 +1336,23 @@ func (s *Store) writeRestructureRollupGroupTx(ctx context.Context, group *restru
 		}
 	}
 	return written, nil
+}
+
+// prepareRestructureStatistics runs only after the shadow tables have been
+// populated. Without these statistics SQLite can scan the entire hourly tier
+// once per metric when rebuilding daily buckets, instead of looking up the
+// series belonging to that metric. Analyze only the shadow query's tables;
+// legacy data, aggregation rules and validation remain unchanged.
+func (s *Store) prepareRestructureStatistics(ctx context.Context) error {
+	if s.cfg.Driver != DriverSQLite {
+		return nil
+	}
+	for _, table := range []string{s.tables.series, s.tables.labels, s.tables.resolutions, s.tables.rollups} {
+		if _, err := s.db.ExecContext(ctx, "ANALYZE "+table); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) rebuildDailyRollups(ctx context.Context) error {

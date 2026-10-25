@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.request
 import uuid
 
@@ -508,8 +509,9 @@ class Cutover:
             self.apply_nginx()
             self.health(self.state['expected_version'], self.state['expected_hash'], expected_restarts=0)
             self.restore_units()
-            self.mark('committed', committed=True)
-            event('upgrade_complete_backups_and_old_container_retained', run_dir=str(self.run))
+            # Persist the success boundary before best-effort reporting. A write
+            # failure here still rolls back; a broken stdout afterwards must not.
+            self.save(phase='committed', committed=True)
         except BaseException as error:
             self.recovery_record(failed_phase=self.state['phase'],
                                  failure_code=str(error) if isinstance(error, SafeFailure) else type(error).__name__)
@@ -521,6 +523,9 @@ class Cutover:
                 self.recovery_event('rollback_incomplete_keep_writers_stopped_manual_recovery_required', run_dir=str(self.run))
                 raise SafeFailure('rollback_incomplete') from None
             raise SafeFailure('upgrade_failed_rolled_back') from None
+        else:
+            self.recovery_event('committed')
+            self.recovery_event('upgrade_complete_backups_and_old_container_retained', run_dir=str(self.run))
         finally:
             self.unlock_calibrator()
 
@@ -701,7 +706,7 @@ class RollbackTests(unittest.TestCase):
         self.op.state.update(stop_intent=True, old_id='old-id', old_image_id='old-image', preserved_name='old',
                              migration_name='migration', units={u: {'ActiveState': 'inactive',
                              'UnitFileState': 'enabled'} for u in UNITS},
-                             old_version={'version': 'old'}, nginx_mode=0o644,
+                             old_version={'version': 'old'}, expected_version='new', expected_hash='new-hash', nginx_mode=0o644,
                              nginx_uid=os.getuid(), nginx_gid=os.getgid())
         self.op.stop_units = lambda: self.commands.append(('stop-units',))
         self.op.lock_calibrator = lambda: None
@@ -848,6 +853,32 @@ class RollbackTests(unittest.TestCase):
         self.assertTrue(self.op.state['rolled_back'])
         self.assertIn(('stop-new',), self.commands)
         self.assertIn(('docker', 'start', 'old-id'), self.commands)
+
+    def test_broken_success_output_cannot_roll_back_committed_service(self):
+        self.make_backup()
+        self.op.state['swap_intent'] = False
+        self.op.preflight = lambda: None
+        def prepare():
+            shutil.copytree(self.run / 'backup-data', self.run / 'candidate-data')
+            (self.run / 'candidate-data/komari.db').write_bytes(b'migrated')
+            self.op.state['candidate_ready'] = True
+        self.op.migrate_and_audit = prepare
+        self.op.start_candidate = lambda: None
+        self.op.apply_nginx = lambda: None
+        attempted = []
+        def broken_output(code, **fields):
+            if code in ('committed', 'upgrade_complete_backups_and_old_container_retained'):
+                attempted.append(code)
+                raise BrokenPipeError('simulated closed output pipe')
+        with mock.patch(__name__ + '.event', side_effect=broken_output):
+            self.op.execute()
+        persisted = json.loads((self.run / 'state.json').read_bytes())
+        self.assertTrue(persisted['committed'])
+        self.assertEqual(persisted['phase'], 'committed')
+        self.assertEqual(len(attempted), 2)
+        self.assertNotIn(('stop-new',), self.commands)
+        self.assertFalse(self.op.state.get('rolled_back', False))
+        self.assertEqual((self.data / 'komari.db').read_bytes(), b'migrated')
 
     def test_failed_unit_stop_still_stops_containers_but_never_swaps_data(self):
         self.make_backup()

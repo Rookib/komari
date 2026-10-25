@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -153,14 +154,7 @@ func (s *Store) internResolutionTx(ctx context.Context, interval time.Duration, 
 }
 
 func joinSQL(parts []string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	out := parts[0]
-	for _, part := range parts[1:] {
-		out += ", " + part
-	}
-	return out
+	return strings.Join(parts, ", ")
 }
 
 func (s *Store) normalizedRollupUpsertSuffix() string {

@@ -10,7 +10,7 @@ inputs:
     default: https://github.com/Rookib/komari-web
   ref:
     description: Pinned custom komari-web commit; empty inputs use the reviewed commit.
-    default: "42b6164f86c6e7f457da4dcf3d4cc3272757519b"
+    default: "bfedb649b27e4e7f60fbb2c321d893418a0e2a2e"
   artifact-name:
     description: Optional artifact name for the packed frontend theme.
     default: ""
@@ -43,9 +43,10 @@ runs:
         git init komari-web
         cd komari-web
         git remote add origin "$FRONTEND_REPOSITORY"
-        git fetch --depth=1 origin "${FRONTEND_REF:-42b6164f86c6e7f457da4dcf3d4cc3272757519b}"
+        git fetch --depth=1 origin "${FRONTEND_REF:-bfedb649b27e4e7f60fbb2c321d893418a0e2a2e}"
         git checkout --detach FETCH_HEAD
         npm ci
+        npm run test:safety
         npm run build
         cd ..
 

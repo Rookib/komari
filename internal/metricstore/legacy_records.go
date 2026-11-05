@@ -10,14 +10,32 @@ import (
 	"github.com/komari-monitor/komari/pkg/metric"
 )
 
-// GetRecordsByClientAndTime 从 metric store 查询记录并重构为 models.Record
-func GetRecordsByClientAndTime(ctx context.Context, clientUUID string, start, end time.Time) ([]models.Record, error) {
+// RecordQueryOptions narrows the record reconstruction work. MetricNames
+// limits which stored load metrics are queried; empty means all load metrics.
+// MaxPoints is a total response-point budget; it is applied before aggregation,
+// so an all-client query does not materialize thousands of points per client
+// only to sample them afterwards.
+type RecordQueryOptions struct {
+	MetricNames []string
+	MaxPoints   int
+}
+
+// GetRecordsByClientAndTime 从 metric store 查询记录并重构为 models.Record。
+// opts 为空表示兼容旧行为；有值时用于指标选择和点数预算。
+func GetRecordsByClientAndTime(ctx context.Context, clientUUID string, start, end time.Time, opts ...RecordQueryOptions) ([]models.Record, error) {
 	s := GetStore()
 	if s == nil {
 		return nil, fmt.Errorf("metric store not enabled")
 	}
 
-	return getRecordsByClientAndTimeFromSeries(ctx, s, clientUUID, start, end)
+	return getRecordsFromSeries(ctx, s, clientUUID, start, end, false, firstRecordOptions(opts))
+}
+
+func firstRecordOptions(opts []RecordQueryOptions) RecordQueryOptions {
+	if len(opts) == 0 {
+		return RecordQueryOptions{}
+	}
+	return opts[0]
 }
 
 // GetRecordMetricMaxByClientAndTime 查询单项监控指标在各时间桶内的最大值。
@@ -30,28 +48,17 @@ func GetRecordMetricMaxByClientAndTime(ctx context.Context, clientUUID, recordMe
 	return getRecordMetricMaxByClientAndTimeFromSeries(ctx, s, clientUUID, recordMetric, start, end)
 }
 
-// GetRecordsByTime 从 metric store 查询所有客户端在时间范围内的记录
-func GetRecordsByTime(ctx context.Context, start, end time.Time) ([]models.Record, error) {
+// GetRecordsByTime 从 metric store 查询所有客户端在时间范围内的记录。
+// opts 为空表示兼容旧行为；有值时用于指标选择和总点数预算。
+func GetRecordsByTime(ctx context.Context, start, end time.Time, opts ...RecordQueryOptions) ([]models.Record, error) {
 	s := GetStore()
 	if s == nil {
 		return nil, fmt.Errorf("metric store not enabled")
 	}
 
-	interval := recordSeriesInterval(s, start, end, time.Now().UTC())
-	entityIDs, err := listRecordEntityIDs(ctx, s, start, end, interval)
-	if err != nil {
-		return nil, err
-	}
-	var records []models.Record
-	for _, entityID := range entityIDs {
-		items, err := getRecordsByClientAndTimeFromSeries(ctx, s, entityID, start, end)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, items...)
-	}
-	sortRecords(records)
-	return records, nil
+	// Query all entities together. Entity-only grouping retains the old per-client
+	// aggregation across tags without repeating the tier scan for every client.
+	return getRecordsFromSeries(ctx, s, "", start, end, true, firstRecordOptions(opts))
 }
 
 type recordSeriesKey struct {
@@ -59,25 +66,58 @@ type recordSeriesKey struct {
 	ts     int64
 }
 
-func getRecordsByClientAndTimeFromSeries(ctx context.Context, s *metric.Store, clientUUID string, start, end time.Time) ([]models.Record, error) {
-	now := time.Now().UTC()
-	interval := recordSeriesInterval(s, start, end, now)
-	recordMap := make(map[recordSeriesKey]*models.Record)
+func getRecordsFromSeries(ctx context.Context, s *metric.Store, clientUUID string, start, end time.Time, allEntities bool, opts RecordQueryOptions) ([]models.Record, error) {
+	metricNames := opts.MetricNames
+	if len(metricNames) == 0 {
+		metricNames = loadRecordMetricNames
+	}
+	specs := make([]MetricSpec, 0, len(metricNames))
+	for _, name := range metricNames {
+		specs = append(specs, MetricSpec{Name: name, Aggregations: []metric.Aggregation{recordMetricAggregation(name)}})
+	}
+	entities := EntityScope{All: allEntities}
+	grouping := GroupMerged
+	if allEntities {
+		grouping = GroupEntity
+	} else {
+		entities.IDs = []string{clientUUID}
+	}
+	rounding := RoundFloor
+	if opts.MaxPoints > 0 {
+		rounding = RoundCeil
+	}
+	loaded, err := QueryMetrics(ctx, MetricsQuery{
+		Store: s, Mode: QuerySeries, Source: SourceRollup,
+		OmitTags: true, OmitLabels: true, CompactDefinitions: true,
+		Entities: entities, Specs: specs, Start: start, End: end,
+		Order: metric.OrderAsc, Grouping: grouping,
+		Budget:   PointBudget{PerSeries: 500, Total: opts.MaxPoints},
+		Rounding: rounding, AllowMissing: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query metrics: %w", err)
+	}
+	return assembleRecordsFromSeries(loaded.Values, clientUUID), nil
+}
 
-	for _, metricName := range loadRecordMetricNames {
-		points, err := s.Series(ctx, metric.AggregateQuery{
-			Query: metric.Query{
-				MetricName: metricName,
-				EntityID:   clientUUID,
-				Start:      start,
-				End:        end,
-				Order:      metric.OrderAsc,
-			},
-			Aggregation: recordMetricAggregation(metricName),
-			Interval:    interval,
-		}, now)
-		if err != nil {
-			return nil, fmt.Errorf("failed to query metric %s: %w", metricName, err)
+// assembleRecordsFromSeries unions metric buckets without allocating a record per key.
+func assembleRecordsFromSeries(values map[string]map[metric.Aggregation][]metric.AggregatePoint, clientUUID string) []models.Record {
+	// Aligned metrics normally share buckets: the largest selected metric is a
+	// conservative capacity estimate, not the sum of the metric fanout. Missing
+	// buckets can grow the union beyond it (and duplicate seconds can shrink it).
+	capacity := 0
+	for name, aggregations := range values {
+		if n := len(aggregations[recordMetricAggregation(name)]); n > capacity {
+			capacity = n
+		}
+	}
+	records := make([]models.Record, 0, capacity)
+	recordIndex := make(map[recordSeriesKey]int, capacity)
+	for metricName, aggMap := range values {
+		agg := recordMetricAggregation(metricName)
+		points, ok := aggMap[agg]
+		if !ok {
+			continue
 		}
 		for _, point := range points {
 			entityID := point.EntityID
@@ -85,22 +125,22 @@ func getRecordsByClientAndTimeFromSeries(ctx context.Context, s *metric.Store, c
 				entityID = clientUUID
 			}
 			key := recordSeriesKey{client: entityID, ts: point.Bucket.Unix()}
-			if recordMap[key] == nil {
-				recordMap[key] = &models.Record{
+			index, exists := recordIndex[key]
+			if !exists {
+				index = len(records)
+				recordIndex[key] = index
+				records = append(records, models.Record{
 					Client: entityID,
 					Time:   point.Bucket.UTC(),
-				}
+				})
 			}
-			applyRecordMetricValue(recordMap[key], metricName, point.Value)
+			// Resolve the address after append: the backing array may have moved.
+			applyRecordMetricValue(&records[index], metricName, point.Value)
 		}
 	}
 
-	records := make([]models.Record, 0, len(recordMap))
-	for _, rec := range recordMap {
-		records = append(records, *rec)
-	}
 	sortRecords(records)
-	return records, nil
+	return records
 }
 
 func getRecordMetricMaxByClientAndTimeFromSeries(ctx context.Context, s *metric.Store, clientUUID, recordMetric string, start, end time.Time) ([]models.Record, error) {
@@ -109,22 +149,19 @@ func getRecordMetricMaxByClientAndTimeFromSeries(ctx context.Context, s *metric.
 		return nil, fmt.Errorf("unsupported record metric %q", recordMetric)
 	}
 
-	now := time.Now().UTC()
-	points, err := s.Series(ctx, metric.AggregateQuery{
-		Query: metric.Query{
-			MetricName: metricName,
-			EntityID:   clientUUID,
-			Start:      start,
-			End:        end,
-			Order:      metric.OrderAsc,
-		},
-		Aggregation: metric.AggMax,
-		Interval:    recordSeriesInterval(s, start, end, now),
-	}, now)
+	loaded, err := QueryMetrics(ctx, MetricsQuery{
+		Store: s, Mode: QuerySeries, Source: SourceRollup,
+		OmitTags: true, OmitLabels: true, CompactDefinitions: true,
+		Entities: EntityScope{IDs: []string{clientUUID}},
+		Specs:    []MetricSpec{{Name: metricName, Aggregations: []metric.Aggregation{metric.AggMax}}},
+		Start:    start, End: end, Order: metric.OrderAsc, Grouping: GroupMerged,
+		Budget: PointBudget{PerSeries: 500}, Rounding: RoundFloor, AllowMissing: true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query metric %s: %w", metricName, err)
 	}
 
+	points := loaded.Values[metricName][metric.AggMax]
 	records := make([]models.Record, 0, len(points))
 	for _, point := range points {
 		entityID := point.EntityID
@@ -147,49 +184,6 @@ func recordMetricAggregation(metricName string) metric.Aggregation {
 	default:
 		return metric.AggAvg
 	}
-}
-
-func recordSeriesInterval(s *metric.Store, start, end, now time.Time) time.Duration {
-	interval := recordDownsampleInterval(end.Sub(start), 500)
-	return s.CompatibleSeriesInterval(start, now, interval)
-}
-
-func recordDownsampleInterval(rangeDuration time.Duration, maxPoints int) time.Duration {
-	if maxPoints <= 0 {
-		maxPoints = 500
-	}
-	nanos := rangeDuration.Nanoseconds()
-	if nanos <= 0 {
-		return time.Second
-	}
-	interval := time.Duration((nanos + int64(maxPoints) - 1) / int64(maxPoints))
-	if interval < time.Second {
-		return time.Second
-	}
-	return metric.FloorStandardInterval(interval)
-}
-
-func listRecordEntityIDs(ctx context.Context, s *metric.Store, start, end time.Time, interval time.Duration) ([]string, error) {
-	seen := make(map[string]struct{})
-	for _, metricName := range loadRecordMetricNames {
-		ids, err := s.EntityIDs(ctx, metric.Query{
-			MetricName: metricName,
-			Start:      start.Add(-interval),
-			End:        end,
-		})
-		if err != nil {
-			return nil, err
-		}
-		for _, id := range ids {
-			seen[id] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for id := range seen {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out, nil
 }
 
 func applyRecordMetricValue(rec *models.Record, metricName string, value float64) {
@@ -253,17 +247,21 @@ func GetGPURecordsByClientAndTime(ctx context.Context, clientUUID string, start,
 	}
 	recordMap := make(map[gpuKey]*models.GPURecord)
 
+	specs := make([]MetricSpec, 0, len(gpuMetrics))
+	for _, name := range gpuMetrics {
+		specs = append(specs, MetricSpec{Name: name})
+	}
+	loaded, err := QueryMetrics(ctx, MetricsQuery{
+		Store: s, Mode: QueryPoints, Source: SourceRaw,
+		OmitLabels: true, CompactDefinitions: true,
+		Entities: EntityScope{IDs: []string{clientUUID}}, Specs: specs,
+		Start: start, End: end, Order: metric.OrderAsc, AllowMissing: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query GPU metrics: %w", err)
+	}
 	for _, metricName := range gpuMetrics {
-		points, err := s.Query(ctx, metric.Query{
-			MetricName: metricName,
-			EntityID:   clientUUID,
-			Start:      start,
-			End:        end,
-			Order:      metric.OrderAsc,
-		})
-		if err != nil {
-			continue // GPU 数据可能不存在
-		}
+		points := loaded.Raw[metricName]
 
 		for _, p := range points {
 			deviceIndex := 0
@@ -307,7 +305,3 @@ func GetGPURecordsByClientAndTime(ctx context.Context, clientUUID string, start,
 
 	return records, nil
 }
-
-// GetPingRecords 从 metric store 查询兼容旧接口的 ping 记录。
-//
-// 旧接口过去直接读取 ping_records。这里使用与 queryMetrics 相同的 Series

@@ -19,6 +19,27 @@ jobs:
         with:
           artifact-name: komari-frontend
 
+  safety-regressions:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-frontend
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Run Linux application and security tests
+        run: go test ./...
+      - name: Check concurrent agent controls and reports
+        run: go test -race ./web/agent ./web/api/client ./web/api/securityconsole ./utils/notifier ./pkg/rpc
+      - name: Check deployment and calibration safeguards
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover -s tools/deploy-safe-upgrade -p 'test_audit_data.py' -v
+          python3 tools/deploy-safe-upgrade/cutover.py --self-test
+          python3 -m unittest discover -s tools/dmit-wan-calibrator -p 'test_calibrator.py' -v
+
   build-binaries:
     needs: build-frontend
     runs-on: ubuntu-latest

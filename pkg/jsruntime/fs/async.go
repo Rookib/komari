@@ -290,7 +290,7 @@ func (m *Module) prepareFSAsync(vm *moejs.Runtime, name string, arguments []moej
 	case "open":
 		pathName := native.String(vm, fsArgument(arguments, 0))
 		flags := native.String(vm, fsArgument(arguments, 1))
-		mode := fsWriteMode(vm, fsArgument(arguments, 2))
+		mode := fsMode(vm, fsArgument(arguments, 2), 0o666)
 		return fsAsyncOperation{run: func() (any, error) {
 			path, err := follow(pathName, true)
 			if err != nil {

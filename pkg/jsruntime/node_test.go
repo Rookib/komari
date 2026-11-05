@@ -51,6 +51,46 @@ func TestNodeCoreModulesAndECMAScriptBuiltins(t *testing.T) {
 	}
 }
 
+func TestNodeFSOpenKeepsStringPermissionModes(t *testing.T) {
+	base := t.TempDir()
+	js, err := New(`
+		async function verify(kind) {
+			const fs = require("fs");
+			const path = kind + ".txt";
+			if (kind === "sync") {
+				fs.closeSync(fs.openSync(path, "w", "600"));
+			} else if (kind === "promise") {
+				const handle = await fs.promises.open(path, "w", "600");
+				await handle.close();
+			} else {
+				await new Promise((resolve, reject) => fs.open(path, "w", "600", (err, fd) => {
+					if (err) return reject(err);
+					fs.close(fd, err => err ? reject(err) : resolve());
+				}));
+			}
+			return true;
+		}
+	`, Options{NodeJS: true, BaseDir: base, Console: io.Discard, Timeout: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer js.Close()
+	for _, kind := range []string{"sync", "promise", "callback"} {
+		t.Run(kind, func(t *testing.T) {
+			if err := js.Call("verify", kind); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(filepath.Join(base, kind+".txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("private open mode widened to %o", info.Mode().Perm())
+			}
+		})
+	}
+}
+
 func TestNodeFSWriteOptionsPreservePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file permission modes are not supported on Windows")

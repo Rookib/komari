@@ -798,7 +798,7 @@ func (m *Module) fsOpen(vm *moejs.Runtime, args []moejs.Value) int {
 		panic(native.GoError(vm, err))
 	}
 	flags := fsOpenFlags(native.String(vm, moejs.Arg(args, 1)))
-	file, err := m.nodeOpenFile(path, flags, fsWriteMode(vm, moejs.Arg(args, 2)))
+	file, err := m.nodeOpenFile(path, flags, fsMode(vm, moejs.Arg(args, 2), 0o666))
 	if err != nil {
 		panic(native.GoError(vm, err))
 	}

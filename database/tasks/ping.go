@@ -2,8 +2,8 @@ package tasks
 
 import (
 	"context"
+	"slices"
 	"sort"
-	"time"
 
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
@@ -28,17 +28,8 @@ func AddPingTask(clients []string, defaultOn bool, name string, target, task_typ
 		if err := tx.Create(&task).Error; err != nil {
 			return err
 		}
-
 		// Append by id to avoid races between concurrent create requests.
-		result := tx.Model(&models.PingTask{}).Where("id = ?", task.Id).Update("weight", int(task.Id))
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			return gorm.ErrRecordNotFound
-		}
-
-		return nil
+		return tx.Model(&models.PingTask{}).Where("id = ?", task.Id).Update("weight", int(task.Id)).Error
 	})
 	if err != nil {
 		return 0, err
@@ -138,10 +129,8 @@ func UpdatePingTaskOrder(order map[uint]int) error {
 		}
 
 		for _, id := range ids {
-			weight := order[id]
-			result := tx.Model(&models.PingTask{}).Where("id = ?", id).Update("weight", weight)
-			if result.Error != nil {
-				return result.Error
+			if err := tx.Model(&models.PingTask{}).Where("id = ?", id).Update("weight", order[id]).Error; err != nil {
+				return err
 			}
 		}
 		return nil
@@ -178,27 +167,14 @@ func ReloadPingSchedule() error {
 
 // AddDefaultOnClientUUID 在新客户端注册后，把该 UUID 追加到所有 default_on=true 的任务的 clients 中（去重）。
 func AddDefaultOnClientUUID(uuid string) error {
-	if uuid == "" {
-		return nil
-	}
 	db := dbcore.GetDBInstance()
 	var tasks []models.PingTask
 	if err := db.Where("all_clients = ?", true).Find(&tasks).Error; err != nil {
 		return err
 	}
-	if len(tasks) == 0 {
-		return nil
-	}
 	changed := false
 	for _, task := range tasks {
-		exists := false
-		for _, c := range task.Clients {
-			if c == uuid {
-				exists = true
-				break
-			}
-		}
-		if exists {
+		if slices.Contains(task.Clients, uuid) {
 			continue
 		}
 		next := append(models.StringArray{}, task.Clients...)
@@ -212,8 +188,4 @@ func AddDefaultOnClientUUID(uuid string) error {
 		return ReloadPingSchedule()
 	}
 	return nil
-}
-
-func GetPingRecords(uuid string, taskId int, start, end time.Time) ([]models.PingRecord, error) {
-	return metricstore.GetPingRecords(context.Background(), uuid, taskId, start, end)
 }

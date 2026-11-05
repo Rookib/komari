@@ -48,6 +48,7 @@ Docker、二进制文件、源码构建和更新说明，请参阅 [安装指南
 
 | 赞助商                                                                                                                                                                                           | 描述                                                                                                                                                                                                                |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <a href="https://mooproxy.net/?utm_source=komari"><img src="https://raw.githubusercontent.com/komari-monitor/public/refs/heads/main/images/Mooproxy-logo-transparent.png" alt="mooproxy.net" width="180"></a> | [MooProxy · 动态住宅代理IP低至 $0.20/GB，注册即送 500MB 免费流量，立即体验！](https://mooproxy.net/?utm_source=komari) |
 | <a href="https://axisnow.io/zh?utm=komari"><img src="https://raw.githubusercontent.com/komari-monitor/public/refs/heads/main/images/AxisNow.jpg" alt="AxisNow" width="180"></a> | [自建私有部署CDN \| 订阅式高仿CDN \| 自主可控、灵活组合的CDN网络](https://axisnow.io/zh?utm=komari) |
 | <a href="https://whmcs.as211392.com/aff.php?aff=110"><img src="https://raw.githubusercontent.com/komari-monitor/public/refs/heads/main/images/dreamcloud.png" alt="Dream Cloud" width="180"></a> | 极高性价比解锁直连亚太高防，真高防，不虚标，打死退款                                                                                                                                                                |
 | <a href="https://sharon.io"><img src="https://raw.githubusercontent.com/komari-monitor/public/refs/heads/main/images/sharon-networks.webp" alt="Sharon Networks" width="180"></a>                | 亚太数据中心提供顶级的中国优化网络接入 · 低延时&高带宽&提供Tbps级本地清洗高防服务, 为您的业务保驾护航, 为您的客户提供极致体验. 加入社区 [Telegram群组](https://t.me/SharonNetwork) 可参与公益募捐或群内抽奖免费使用 |
@@ -62,6 +63,6 @@ Docker、二进制文件、源码构建和更新说明，请参阅 [安装指南
 
 如果 Komari 对你有所帮助，欢迎请作者喝一杯奶茶。感谢你的支持！
 
-| 微信赞赏码                                                                                       | TRON Network                                                                |
-| ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| ![wechat](https://b2.akz.moe/awesome-pictures/%E5%BE%AE%E4%BF%A1%E8%B5%9E%E8%B5%8F%E7%A0%81.png) | ![TRON](https://b2.akz.moe/awesome-pictures/PixPin_2026-08-07_15-16-52.png) |
+| TRON Network                                                                |
+| --------------------------------------------------------------------------- |
+| ![TRON](https://b2.akz.moe/awesome-pictures/PixPin_2026-08-07_15-16-52.png) |

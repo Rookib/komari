@@ -62,39 +62,33 @@ func writePingRecords(ctx context.Context, records []models.PingRecord) error {
 	return s.WriteBatch(ctx, points)
 }
 
+// GetPingRecords returns legacy-shaped ping records, newest first.
 func GetPingRecords(ctx context.Context, clientUUID string, taskID int, start, end time.Time) ([]models.PingRecord, error) {
 	s := GetStore()
 	if s == nil {
 		return nil, fmt.Errorf("metric store not enabled")
 	}
 
-	query := metric.Query{
-		MetricName: MetricPingLatency,
-		Start:      start,
-		End:        end,
-		Order:      metric.OrderAsc,
+	query := MetricsQuery{
+		Store: s, Mode: QuerySeries, Source: SourceRollup,
+		CompactDefinitions: true,
+		Entities:           EntityScope{All: clientUUID == ""},
+		Specs:              []MetricSpec{{Name: MetricPingLatency, Aggregations: []metric.Aggregation{metric.AggLast}}},
+		Start:              start, End: end, Order: metric.OrderAsc, Grouping: GroupSeries,
+		Budget: PointBudget{PerSeries: 4000}, Rounding: RoundFloor, AllowMissing: true,
 	}
-
 	if clientUUID != "" {
-		query.EntityID = clientUUID
+		query.Entities.IDs = []string{clientUUID}
 	}
-
 	if taskID >= 0 {
 		query.Tags = map[string]string{"task_id": fmt.Sprintf("%d", taskID)}
 	}
-
-	interval := pingQueryInterval(end.Sub(start), 4000)
-	interval = s.CompatibleSeriesInterval(start, time.Now().UTC(), interval)
-	points, err := s.Series(ctx, metric.AggregateQuery{
-		Query:          query,
-		Aggregation:    metric.AggLast,
-		Interval:       interval,
-		PreserveSeries: true,
-	}, time.Now().UTC())
+	loaded, err := QueryMetrics(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 
+	points := loaded.Values[MetricPingLatency][metric.AggLast]
 	records := make([]models.PingRecord, 0, len(points))
 	for _, p := range points {
 		taskIDVal := uint(0)
@@ -116,18 +110,4 @@ func GetPingRecords(ctx context.Context, clientUUID string, taskID int, start, e
 	})
 
 	return records, nil
-}
-
-func pingQueryInterval(rangeDuration time.Duration, maxPoints int) time.Duration {
-	if maxPoints <= 0 {
-		maxPoints = 4000
-	}
-	if rangeDuration <= 0 {
-		return time.Second
-	}
-	interval := time.Duration((rangeDuration.Nanoseconds() + int64(maxPoints) - 1) / int64(maxPoints))
-	if interval < time.Second {
-		return time.Second
-	}
-	return metric.FloorStandardInterval(interval)
 }

@@ -21,12 +21,7 @@ import (
 )
 
 func DeleteClient(clientUuid string) error {
-	db := dbcore.GetDBInstance()
-	err := db.Delete(&models.Client{}, "uuid = ?", clientUuid).Error
-	if err != nil {
-		return err
-	}
-	return nil
+	return dbcore.GetDBInstance().Delete(&models.Client{}, "uuid = ?", clientUuid).Error
 }
 
 func SaveClientInfo(update map[string]interface{}) error {
@@ -34,11 +29,6 @@ func SaveClientInfo(update map[string]interface{}) error {
 	clientUUID, ok := update["uuid"].(string)
 	if !ok || clientUUID == "" {
 		return fmt.Errorf("invalid client UUID")
-	}
-
-	// 确保更新的字段不为空
-	if len(update) == 0 {
-		return fmt.Errorf("no fields to update")
 	}
 
 	update["updated_at"] = time.Now().UTC()
@@ -131,11 +121,7 @@ func SaveClientInfo(update map[string]interface{}) error {
 		return err
 	}
 
-	err := db.Model(&models.Client{}).Where("uuid = ?", clientUUID).Updates(update).Error
-	if err != nil {
-		return err
-	}
-	return nil
+	return db.Model(&models.Client{}).Where("uuid = ?", clientUUID).Updates(update).Error
 }
 
 func normalizeVnstatBasicInfo(db *gorm.DB, clientUUID string, update map[string]interface{}) error {
@@ -285,8 +271,7 @@ func CreateClient() (clientUUID, token string, err error) {
 		UpdatedAt: time.Now().UTC(),
 	}
 
-	err = db.Create(&client).Error
-	if err != nil {
+	if err := db.Create(&client).Error; err != nil {
 		return "", "", err
 	}
 	if err := tasks.AddDefaultOnClientUUID(clientUUID); err != nil {
@@ -310,8 +295,7 @@ func CreateClientWithName(name string) (clientUUID, token string, err error) {
 		UpdatedAt: time.Now().UTC(),
 	}
 
-	err = db.Create(&client).Error
-	if err != nil {
+	if err := db.Create(&client).Error; err != nil {
 		return "", "", err
 	}
 	if err := tasks.AddDefaultOnClientUUID(clientUUID); err != nil {
@@ -320,41 +304,25 @@ func CreateClientWithName(name string) (clientUUID, token string, err error) {
 	return clientUUID, token, nil
 }
 
-/*
-// GetAllClients 获取所有客户端配置
-
-	func getAllClients() (clients []models.Client, err error) {
-		db := dbcore.GetDBInstance()
-		err = db.Find(&clients).Error
-		if err != nil {
-			return nil, err
-		}
-		return clients, nil
-	}
-*/
-func GetClientByUUID(uuid string) (client models.Client, err error) {
-	db := dbcore.GetDBInstance()
-	err = db.Where("uuid = ?", uuid).First(&client).Error
-	if err != nil {
+func GetClientByUUID(uuid string) (models.Client, error) {
+	var client models.Client
+	if err := dbcore.GetDBInstance().Where("uuid = ?", uuid).First(&client).Error; err != nil {
 		return models.Client{}, err
 	}
 	return client, nil
 }
 
-func GetClientTokenByUUID(uuid string) (token string, err error) {
-	db := dbcore.GetDBInstance()
+func GetClientTokenByUUID(uuid string) (string, error) {
 	var client models.Client
-	err = db.Where("uuid = ?", uuid).First(&client).Error
-	if err != nil {
+	if err := dbcore.GetDBInstance().Where("uuid = ?", uuid).First(&client).Error; err != nil {
 		return "", err
 	}
 	return client.Token, nil
 }
 
-func GetAllClientBasicInfo() (clients []models.Client, err error) {
-	db := dbcore.GetDBInstance()
-	err = db.Find(&clients).Error
-	if err != nil {
+func GetAllClientBasicInfo() ([]models.Client, error) {
+	var clients []models.Client
+	if err := dbcore.GetDBInstance().Find(&clients).Error; err != nil {
 		return nil, err
 	}
 	return clients, nil
@@ -365,11 +333,6 @@ func SaveClient(updates map[string]interface{}) error {
 	clientUUID, ok := updates["uuid"].(string)
 	if !ok || clientUUID == "" {
 		return fmt.Errorf("invalid client UUID")
-	}
-
-	// 确保更新的字段不为空
-	if len(updates) == 0 {
-		return fmt.Errorf("no fields to update")
 	}
 
 	if v, exists := updates["traffic_limit"]; exists {
@@ -404,9 +367,5 @@ func SaveClient(updates map[string]interface{}) error {
 
 	updates["updated_at"] = time.Now().UTC()
 
-	err := db.Model(&models.Client{}).Where("uuid = ?", clientUUID).Updates(updates).Error
-	if err != nil {
-		return err
-	}
-	return nil
+	return db.Model(&models.Client{}).Where("uuid = ?", clientUUID).Updates(updates).Error
 }
